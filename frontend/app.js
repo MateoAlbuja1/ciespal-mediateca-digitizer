@@ -725,29 +725,43 @@ Exact JSON format:
 
     let response = null;
     let lastError = '';
+    const maxAttempts = 3;
 
-    for (const model of GEMINI_MODELS) {
-      try {
-        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-        const res = await fetch(`${apiUrl}?key=${getApiKey()}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(extractionPrompt)
-        });
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      for (const model of GEMINI_MODELS) {
+        try {
+          const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+          const res = await fetch(`${apiUrl}?key=${getApiKey()}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(extractionPrompt)
+          });
 
-        if (res.ok) {
-          response = res;
-          break;
-        } else {
-          const errData = await res.json().catch(() => ({}));
-          lastError = errData?.error?.message || `Error ${res.status}`;
+          if (res.ok) {
+            response = res;
+            break;
+          } else {
+            const errData = await res.json().catch(() => ({}));
+            lastError = errData?.error?.message || `Error ${res.status}`;
+            if (res.status === 429) {
+              updateProcessingProgress(`Servidor Google Gemini ocupado. Reintentando (${attempt}/${maxAttempts})...`, 70);
+            }
+          }
+        } catch (err) {
+          lastError = err.message;
         }
-      } catch (err) {
-        lastError = err.message;
+      }
+
+      if (response) break;
+
+      if (attempt < maxAttempts) {
+        // Pausa de 3 segundos para refrescar la cuota por minuto de Google
+        await new Promise(r => setTimeout(r, 3000));
       }
     }
 
     if (!response) {
+      alert(`⚠️ Límite temporal de consultas de Google alcanzado:\n\nGoogle Gemini reportó límite de velocidad por minuto (HTTP 429).\n\nEspere 30 segundos y vuelva a presionar 'Compilar y Generar PDF' para reintentar la extracción de metadatos.`);
       throw new Error(`No se pudo conectar con Gemini AI: ${lastError}`);
     }
 
