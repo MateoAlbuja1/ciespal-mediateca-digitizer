@@ -3,9 +3,11 @@
  * Estilo CamScanner con Previsualización, Reorganización, Repetición de Hojas y Carga de PDF.
  */
 
-// Configuración de API Key para Google Gemini (Modificar con tu clave de API)
-const GEMINI_API_KEY = window.ENV_GEMINI_API_KEY || 'TU_API_KEY_DE_GEMINI_AQUI';
-const GEMINI_MODELS = ['gemini-flash-latest', 'gemini-2.0-flash-lite', 'gemini-2.0-flash'];
+// Configuración de API Key para Google Gemini
+function getApiKey() {
+  return window.ENV_GEMINI_API_KEY || '';
+}
+const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-flash-latest'];
 
 // Configuración de PDF.js para renderizar PDFs subidos
 if (window.pdfjsLib) {
@@ -727,7 +729,7 @@ Exact JSON format:
     for (const model of GEMINI_MODELS) {
       try {
         const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-        const res = await fetch(`${apiUrl}?key=${GEMINI_API_KEY}`, {
+        const res = await fetch(`${apiUrl}?key=${getApiKey()}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(extractionPrompt)
