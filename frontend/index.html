@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>CIESPAL</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- Library for parsing uploaded PDFs directly in browser -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <!-- Library for generating and downloading compiled PDF documents -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+  <div id="app" class="mobile-frame">
+    <!-- Header con el Logo Original CIESPAL -->
+    <header class="app-header">
+      <div class="header-top">
+        <div class="brand">
+          <div class="ciespal-logo-container" title="CIESPAL">
+            <svg class="ciespal-logo-svg" viewBox="0 0 300 135" xmlns="http://www.w3.org/2000/svg">
+              <path d="M 115 22 L 282 66 L 108 58 Z" fill="#1d6295"/>
+              <rect x="25" y="68" width="252" height="6" rx="2" fill="#1d6295"/>
+              <text x="151" y="108" font-family="'Inter', sans-serif" font-weight="900" font-size="44" letter-spacing="1.5" text-anchor="middle" fill="#1d6295">CIESPAL</text>
+              <rect x="20" y="115" width="262" height="5" rx="2" fill="#1d6295"/>
+              <rect x="10" y="124" width="282" height="5" rx="2" fill="#1d6295"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Contenido Principal -->
+    <main class="app-content">
+      <!-- PANTALLA 1: CÁMARA MAXIMIZADA (ESTILO CAMSCANNER) -->
+      <section id="screen-capture" class="screen active">
+        <div class="camera-card">
+          <div class="camera-header">
+            <span class="badge"><i data-lucide="camera"></i> Digitalizador CIESPAL</span>
+            <div class="camera-actions">
+              <button class="icon-btn" id="btn-toggle-camera" title="Cambiar Cámara"><i data-lucide="refresh-cw"></i></button>
+              <button class="icon-btn" id="btn-flash" title="Iluminación"><i data-lucide="zap"></i></button>
+            </div>
+          </div>
+
+          <!-- Barra de Contador de Hojas -->
+          <div class="page-counter-bar">
+            <div class="counter-badge">
+              <i data-lucide="file-stack"></i> Hojas: <strong id="scanned-page-count">0</strong>
+            </div>
+            <button class="btn-finish-pdf hidden" id="btn-finish-pdf">
+              <i data-lucide="sparkles"></i> Compilar y Generar PDF
+            </button>
+          </div>
+
+          <!-- Visor de Cámara Maximizado -->
+          <div class="viewfinder-wrapper">
+            <video id="camera-video" autoplay playsinline muted></video>
+            <canvas id="photo-canvas" class="hidden"></canvas>
+            
+            <div class="scan-frame" id="scan-frame">
+              <div class="corner top-left"></div>
+              <div class="corner top-right"></div>
+              <div class="corner bottom-left"></div>
+              <div class="corner bottom-right"></div>
+              <div class="scan-line" id="scan-line"></div>
+              <p class="scan-hint" id="scan-hint">Encuadre la hoja del libro y presione el botón de captura</p>
+            </div>
+
+            <!-- Overlay de Procesamiento -->
+            <div class="processing-overlay hidden" id="processing-overlay">
+              <div class="spinner"></div>
+              <p class="process-step" id="process-step-text">Procesando OCR e Inteligencia Artificial...</p>
+              <div class="progress-bar">
+                <div class="progress-fill" id="progress-fill"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Carrusel de Miniaturas (Estilo CamScanner) -->
+          <div class="thumbnails-bar hidden" id="thumbnails-bar">
+            <div class="thumbnails-scroll" id="thumbnails-scroll">
+              <!-- Se puebla dinámicamente con las fotos capturadas -->
+            </div>
+          </div>
+
+          <!-- Botonera de Captura -->
+          <div class="capture-controls">
+            <label for="pdf-fallback" class="btn-secondary" title="Cargar PDF existente del libro">
+              <i data-lucide="file-up"></i> Cargar PDF
+              <input type="file" id="pdf-fallback" accept="application/pdf" class="hidden">
+            </label>
+
+            <button class="btn-shutter" id="btn-shutter" title="Capturar Hoja">
+              <div class="shutter-inner"></div>
+            </button>
+
+            <div class="spacer-btn"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- PANTALLA 2: VALIDACIÓN MARC21 -->
+      <section id="screen-review" class="screen">
+        <div class="section-title-bar">
+          <h3><i data-lucide="check-square"></i> Validación de Metadatos y PDF</h3>
+          <span class="badge-tag" id="record-id-badge">ID: --</span>
+        </div>
+
+        <div class="pdf-generated-card hidden" id="pdf-generated-card">
+          <div class="pdf-card-info">
+            <i data-lucide="file-check" class="pdf-icon"></i>
+            <div>
+              <span class="pdf-label">Documento PDF Generado:</span>
+              <h4 id="pdf-filename-display">Titulo_del_Documento.pdf</h4>
+              <span class="pdf-pages-tag" id="pdf-pages-display">Compilación de hojas completada</span>
+            </div>
+          </div>
+          <button type="button" class="btn-pdf-download" id="btn-open-pdf">
+            <i data-lucide="download"></i> Descargar PDF
+          </button>
+        </div>
+
+        <form id="marc-form" class="marc-form">
+          <div class="form-grid">
+            <div class="form-group col-12">
+              <label><span class="marc-tag">245 $a</span> Título Principal de la Obra (Nombre del PDF) *</label>
+              <input type="text" id="field-titulo" required class="form-control">
+            </div>
+
+            <div class="form-group col-12">
+              <label><span class="marc-tag">245 $b</span> Subtítulo o Información Secundaria</label>
+              <input type="text" id="field-subtitulo" class="form-control">
+            </div>
+
+            <div class="form-group col-6">
+              <label><span class="marc-tag">100 $a</span> Autor Principal (Apellidos, Nombres)</label>
+              <input type="text" id="field-autor" required class="form-control">
+            </div>
+
+            <div class="form-group col-6">
+              <label><span class="marc-tag">020 $a</span> ISBN / ISSN / DOI</label>
+              <input type="text" id="field-isbn" class="form-control">
+            </div>
+
+            <div class="form-group col-6">
+              <label><span class="marc-tag">264 $b</span> Editorial / Entidad</label>
+              <input type="text" id="field-editorial" class="form-control">
+            </div>
+
+            <div class="form-group col-6">
+              <label><span class="marc-tag">264 $a / $c</span> Lugar y Año</label>
+              <div class="dual-input">
+                <input type="text" id="field-lugar" placeholder="Ciudad" class="form-control">
+                <input type="text" id="field-anio" placeholder="Año" class="form-control">
+              </div>
+            </div>
+
+            <div class="form-group col-6">
+              <label><span class="marc-tag">300 $a</span> Extensión Física (Páginas totales)</label>
+              <input type="text" id="field-paginas" class="form-control">
+            </div>
+
+            <div class="form-group col-6">
+              <label><span class="marc-tag">856 $u</span> Enlace al PDF Digitalizado</label>
+              <input type="text" id="field-pdf-url" class="form-control" readonly>
+            </div>
+
+            <div class="form-group col-12">
+              <label><span class="marc-tag">700 $a</span> Autores Secundarios / Colaboradores</label>
+              <input type="text" id="field-autores-sec" class="form-control">
+            </div>
+
+            <div class="form-group col-12">
+              <label><span class="marc-tag">650 $a</span> Palabras Clave / Descriptores</label>
+              <input type="text" id="field-palabras-clave" class="form-control">
+            </div>
+
+            <div class="form-group col-12">
+              <label><span class="marc-tag">520 $a</span> Resumen (Abstract de la Obra)</label>
+              <textarea id="field-resumen" rows="3" class="form-control"></textarea>
+            </div>
+          </div>
+
+          <div class="form-actions">
+            <button type="button" id="btn-discard" class="btn-cancel"><i data-lucide="trash-2"></i> Descartar</button>
+            <button type="submit" class="btn-primary"><i data-lucide="check"></i> Guardar y Vincular PDF</button>
+          </div>
+        </form>
+      </section>
+
+      <!-- PANTALLA 3: HISTORIAL & EXPORTACIÓN CSV KOHA -->
+      <section id="screen-export" class="screen">
+        <div class="export-header-card">
+          <div>
+            <h3><i data-lucide="file-spreadsheet"></i> Lote de Exportación para Koha</h3>
+            <p>Registros validados en formato estándar MARC21</p>
+          </div>
+          <button id="btn-download-csv" class="btn-primary">
+            <i data-lucide="download"></i> Descargar CSV Koha
+          </button>
+        </div>
+
+        <div class="table-responsive">
+          <table class="koha-table">
+            <thead>
+              <tr>
+                <th>020a (ISBN)</th>
+                <th>245a (Título / PDF)</th>
+                <th>100a (Autor)</th>
+                <th>300a (Págs)</th>
+                <th>856u (PDF)</th>
+                <th>Acción</th>
+              </tr>
+            </thead>
+            <tbody id="koha-records-body">
+              <!-- Se puebla dinámicamente -->
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <!-- Modal de Previsualización, Reemplazo y Borrado de Hojas -->
+    <div class="page-modal hidden" id="page-modal">
+      <div class="page-modal-content">
+        <div class="page-modal-header">
+          <span id="modal-page-title" class="modal-title">Hoja #1</span>
+          <button type="button" class="icon-btn-close" id="btn-close-modal"><i data-lucide="x"></i></button>
+        </div>
+        <div class="page-modal-body">
+          <img id="modal-page-img" src="" alt="Previsualización de hoja escaneada">
+        </div>
+        <div class="page-modal-footer">
+          <button type="button" class="btn-danger" id="btn-delete-page">
+            <i data-lucide="trash-2"></i> Eliminar
+          </button>
+          <button type="button" class="btn-retake" id="btn-retake-page">
+            <i data-lucide="camera"></i> Repetir / Volver a Tomar
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal de Visor PDF Integrado -->
+    <div class="page-modal hidden" id="pdf-viewer-modal" style="z-index: 9999;">
+      <div class="page-modal-content" style="max-height: 90vh; display: flex; flex-direction: column;">
+        <div class="page-modal-header">
+          <span id="pdf-modal-title" class="modal-title">📄 Documento PDF Digitalizado</span>
+          <button type="button" class="icon-btn-close" id="btn-close-pdf-modal"><i data-lucide="x"></i></button>
+        </div>
+        <div class="page-modal-body" id="pdf-modal-pages-container" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding: 12px; background: #111;">
+          <!-- Se cargan dinámicamente las páginas del PDF -->
+        </div>
+        <div class="page-modal-footer" style="flex-wrap: wrap; gap: 8px;">
+          <button type="button" class="btn-primary" id="btn-open-external-pdf" style="flex: 1;">
+            <i data-lucide="download"></i> Descargar PDF
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal de Visor CSV Koha -->
+    <div class="page-modal hidden" id="csv-viewer-modal" style="z-index: 9999;">
+      <div class="page-modal-content" style="max-height: 85vh;">
+        <div class="page-modal-header">
+          <span class="modal-title">📊 Exportación Koha MARC21 (CSV)</span>
+          <button type="button" class="icon-btn-close" id="btn-close-csv-modal"><i data-lucide="x"></i></button>
+        </div>
+        <div class="page-modal-body" style="overflow: auto; max-height: 50vh; font-family: monospace; font-size: 0.72rem; white-space: pre-wrap; background: #181818; padding: 12px; border-radius: 8px; color: #4ade80;" id="csv-modal-content">
+          <!-- Contenido CSV -->
+        </div>
+        <div class="page-modal-footer" style="gap: 8px;">
+          <button type="button" class="btn-primary" id="btn-copy-csv" style="flex: 1;">
+            <i data-lucide="copy"></i> Copiar CSV
+          </button>
+          <button type="button" class="btn-retake" id="btn-download-csv-file" style="flex: 1;">
+            <i data-lucide="download"></i> Descargar CSV
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Barra de Navegación Inferior Monocroma -->
+    <nav class="app-bottom-nav">
+      <button class="nav-item active" data-target="screen-capture">
+        <i data-lucide="camera"></i>
+        <span>Escáner</span>
+      </button>
+      <button class="nav-item" data-target="screen-review">
+        <i data-lucide="sliders"></i>
+        <span>Validación</span>
+        <span class="badge-count" id="pending-count">0</span>
+      </button>
+      <button class="nav-item" data-target="screen-export">
+        <i data-lucide="database"></i>
+        <span>Exportar</span>
+      </button>
+    </nav>
+  </div>
+
+  <script src="app.js"></script>
+  <script>
+    lucide.createIcons();
+  </script>
+</body>
+</html>

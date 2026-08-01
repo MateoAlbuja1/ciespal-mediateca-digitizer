@@ -1,0 +1,13 @@
+{
+  "appId": "org.ciespal.mediateca.digitizer",
+  "appName": "CIESPAL",
+  "webDir": "www",
+  "plugins": {
+    "Camera": {
+      "permissions": ["camera", "photos"]
+    }
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}

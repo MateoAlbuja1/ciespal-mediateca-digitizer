@@ -1,0 +1,11 @@
+node_modules/
+.gradle/
+build/
+*.apk
+frontend/www/
+frontend/android/app/build/
+frontend/android/.gradle/
+frontend/android/build/
+frontend/node_modules/
+.DS_Store
+*.log
