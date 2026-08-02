@@ -7,7 +7,7 @@
 function getApiKey() {
   return window.ENV_GEMINI_API_KEY || '';
 }
-const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-flash-latest'];
+const GEMINI_MODELS = ['gemini-3.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest'];
 
 // Configuración de PDF.js para renderizar PDFs subidos
 if (window.pdfjsLib) {
