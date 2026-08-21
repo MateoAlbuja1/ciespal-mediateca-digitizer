@@ -3,11 +3,30 @@
  * Estilo CamScanner con Previsualización, Reorganización, Repetición de Hojas y Carga de PDF.
  */
 
-// Configuración de API Key para Google Gemini
-function getApiKey() {
-  return window.ENV_GEMINI_API_KEY || '';
+// Sistema de Gestión y Rotación Automática de Múltiples Claves API (Google Gemini)
+function getApiKeys() {
+  const stored = localStorage.getItem('ciespal_gemini_keys');
+  if (stored) {
+    const keys = stored.split(/[\n,;]/).map(k => k.trim()).filter(k => k.length > 8);
+    if (keys.length > 0) return keys;
+  }
+  if (window.ENV_GEMINI_API_KEYS && Array.isArray(window.ENV_GEMINI_API_KEYS) && window.ENV_GEMINI_API_KEYS.length > 0) {
+    return window.ENV_GEMINI_API_KEYS.filter(k => k && k.length > 8);
+  }
+  if (window.ENV_GEMINI_API_KEY && window.ENV_GEMINI_API_KEY.length > 8) {
+    return [window.ENV_GEMINI_API_KEY];
+  }
+  return [];
 }
-const GEMINI_MODELS = ['gemini-3.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest'];
+
+function getApiKey() {
+  const keys = getApiKeys();
+  if (keys.length === 0) return '';
+  const idx = (state.currentKeyIndex || 0) % keys.length;
+  return keys[idx];
+}
+
+const GEMINI_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
 
 // Configuración de PDF.js para renderizar PDFs subidos
 if (window.pdfjsLib) {
@@ -19,10 +38,14 @@ const state = {
   records: [],
   bookPagesBuffer: [],
   bookPagesBase64: [],
+  detectedIndexPages: [],
+  currentKeyIndex: 0,       // Índice para rotación automática de claves API
+  scanFilterMode: 'magic_color', // 'magic_color' (Fondo Blanco Inteligente), 'bw' (B/N OpenCV), 'original'
   cameraStream: null,
   cameraReady: false,
   facingMode: 'environment',
   retakeIndex: null,
+  savedPagesBase64: [],
   activeModalIndex: null,
   detectedBounds: null,     // Bordes detectados del documento en tiempo real
   liveDetectionRAF: null    // requestAnimationFrame ID para detección en vivo
@@ -129,6 +152,25 @@ function initEvents() {
     }
   });
 
+  // Selector de Filtro de Imagen (Realce / B/N OpenCV / Original)
+  const btnFilter = document.getElementById('btn-filter-mode');
+  if (btnFilter) {
+    const modes = ['magic_color', 'bw', 'original'];
+    const modeNames = {
+      'magic_color': 'Filtro: ✨ Realce Inteligente (Fondo Blanco Limpio)',
+      'bw': 'Filtro: 📄 B/N Nítido (OpenCV Adaptive Threshold)',
+      'original': 'Filtro: 📸 Color Original'
+    };
+    btnFilter.addEventListener('click', () => {
+      const curr = state.scanFilterMode || 'magic_color';
+      const nextIdx = (modes.indexOf(curr) + 1) % modes.length;
+      state.scanFilterMode = modes[nextIdx];
+      const hint = document.getElementById('scan-hint');
+      if (hint) hint.textContent = modeNames[state.scanFilterMode];
+      alert(modeNames[state.scanFilterMode]);
+    });
+  }
+
   // Modal de Previsualización / Repetición
   document.getElementById('btn-close-modal').addEventListener('click', closeModal);
   document.getElementById('btn-delete-page').addEventListener('click', deleteCurrentModalPage);
@@ -152,7 +194,7 @@ function dataURLToBlob(dataurl) {
   }
 }
 
-// ========== CAPTURA DIRECTA CON RECORTE AUTOMÁTICO DE HOJA / LIBRO ==========
+// ========== CAPTURA DIRECTA CON RECORTE AUTOMÁTICO ESTILO ADOBE SCAN / OPENCV ==========
 function capturePagePhoto() {
   const video = document.getElementById('camera-video');
   const canvas = document.getElementById('photo-canvas');
@@ -172,19 +214,30 @@ function capturePagePhoto() {
   const tempCtx = tempCanvas.getContext('2d');
   tempCtx.drawImage(video, 0, 0, fullW, fullH);
 
-  // 2. Detectar bordes exactos de la hoja o portada del libro
-  const bounds = detectSmartBookBounds(tempCtx, fullW, fullH);
+  // 2. Intentar recorte de 4 esquinas y transformación de perspectiva estilo Adobe Scan con OpenCV.js
+  let openCvSuccess = false;
+  try {
+    openCvSuccess = autoCropPerspectiveOpenCV(tempCanvas, canvas);
+  } catch (err) {
+    console.warn('Error OpenCV:', err);
+  }
 
-  // 3. Recortar ÚNICAMENTE el área de la hoja descartando el fondo (armario, cobijas, piernas, dedos)
-  canvas.width = bounds.w;
-  canvas.height = bounds.h;
-  const ctx = canvas.getContext('2d');
+  // 3. Si OpenCV no detectó un cuadrilátero claro, usar recorte de gradiente inteligente
+  if (!openCvSuccess) {
+    const bounds = detectSmartBookBounds(tempCtx, fullW, fullH);
+    canvas.width = bounds.w;
+    canvas.height = bounds.h;
+    const ctx = canvas.getContext('2d');
 
-  ctx.filter = 'contrast(1.08) brightness(1.03)';
-  ctx.drawImage(tempCanvas, bounds.x, bounds.y, bounds.w, bounds.h, 0, 0, bounds.w, bounds.h);
-  ctx.filter = 'none';
+    ctx.filter = 'contrast(1.08) brightness(1.03)';
+    ctx.drawImage(tempCanvas, bounds.x, bounds.y, bounds.w, bounds.h, 0, 0, bounds.w, bounds.h);
+    ctx.filter = 'none';
+  }
 
-  // Obtener DataURL y Blob recortado de la hoja
+  // 4. Aplicar Filtro de Realce de Documento OpenCV (Fondo Blanco Limpio / B/N Nítido)
+  enhanceDocumentWithOpenCV(canvas, state.scanFilterMode || 'magic_color');
+
+  // Obtener DataURL y Blob recortado y realzado de la hoja
   const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
   const base64 = dataUrl.split(',')[1];
   const blob = dataURLToBlob(dataUrl);
@@ -202,17 +255,206 @@ function capturePagePhoto() {
     state.bookPagesBuffer[targetIdx] = blob;
     state.bookPagesBase64[targetIdx] = base64;
     state.retakeIndex = null;
-    document.getElementById('scan-hint').textContent = `Hoja #${targetIdx + 1} reemplazada y recortada`;
+    document.getElementById('scan-hint').textContent = `Hoja #${targetIdx + 1} reemplazada y realzada`;
   } else {
     // Agregar nueva hoja al libro
     state.bookPagesBuffer.push(blob);
     state.bookPagesBase64.push(base64);
-    document.getElementById('scan-hint').textContent = `Hoja #${state.bookPagesBuffer.length} recortada exitosamente`;
+    document.getElementById('scan-hint').textContent = `Hoja #${state.bookPagesBuffer.length} escaneada y realzada`;
   }
 
   // Actualizar contador y renderizar carrusel de miniaturas inmediatamente
   updatePageCounter();
   renderThumbnails();
+}
+
+/**
+ * Filtro de Realce de Documento OpenCV (Estilo CamScanner / Ventana 'Processed' de OpenCV).
+ * Limpia el fondo del papel a blanco puro (#FFFFFF) y aumenta la nitidez y contraste del texto.
+ */
+function enhanceDocumentWithOpenCV(canvas, mode = 'magic_color') {
+  if (!canvas || canvas.width === 0 || canvas.height === 0 || mode === 'original') return;
+
+  if (typeof cv !== 'undefined' && cv.Mat && cv.imread) {
+    try {
+      const src = cv.imread(canvas);
+      
+      if (mode === 'bw') {
+        // Modo B/N Nítido (OpenCV Adaptive Threshold - como la ventana 'Processed' del video)
+        const gray = new cv.Mat();
+        const dst = new cv.Mat();
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        cv.adaptiveThreshold(gray, dst, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 21, 10);
+        cv.imshow(canvas, dst);
+        gray.delete();
+        dst.delete();
+        src.delete();
+        return;
+      } else {
+        // Modo Realce Inteligente (Magic Color - Fondo blanco puro conservando colores)
+        const enhanced = new cv.Mat();
+        cv.convertScaleAbs(src, enhanced, 1.22, -18);
+        cv.imshow(canvas, enhanced);
+        enhanced.delete();
+        src.delete();
+        return;
+      }
+    } catch (err) {
+      console.warn('Fallback enhanceDocument:', err);
+    }
+  }
+
+  // Fallback rápido con Canvas 2D
+  try {
+    const ctx = canvas.getContext('2d');
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const lum = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
+      if (mode === 'bw') {
+        const val = lum > 135 ? 255 : 0;
+        d[i] = val; d[i+1] = val; d[i+2] = val;
+      } else {
+        if (lum > 165) {
+          d[i] = Math.min(255, d[i] * 1.18);
+          d[i+1] = Math.min(255, d[i] * 1.18);
+          d[i+2] = Math.min(255, d[i] * 1.18);
+        } else if (lum < 115) {
+          d[i] = Math.max(0, d[i] * 0.82);
+          d[i+1] = Math.max(0, d[i] * 0.82);
+          d[i+2] = Math.max(0, d[i] * 0.82);
+        }
+      }
+    }
+    ctx.putImageData(imgData, 0, 0);
+  } catch (e) {}
+}
+
+/**
+ * Recorte automático de 4 esquinas y desalabeo de perspectiva usando OpenCV.js (Estilo Adobe Scan).
+ */
+function autoCropPerspectiveOpenCV(srcCanvas, dstCanvas) {
+  if (typeof cv === 'undefined' || !cv.Mat || !cv.imread) {
+    return false;
+  }
+
+  try {
+    const src = cv.imread(srcCanvas);
+    const gray = new cv.Mat();
+    const blur = new cv.Mat();
+    const edges = new cv.Mat();
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+
+    // 1. Convertir a grises y suavizar ruido
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+
+    // 2. Detección de bordes Canny
+    cv.Canny(blur, edges, 75, 200);
+
+    // 3. Encontrar contornos
+    cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+
+    let maxArea = 0;
+    let maxContourIndex = -1;
+    let bestPoly = null;
+    const imgArea = src.rows * src.cols;
+
+    // Buscar el contorno cuadrilátero de 4 esquinas más grande (área > 10% del total)
+    for (let i = 0; i < contours.size(); ++i) {
+      const cnt = contours.get(i);
+      const area = cv.contourArea(cnt);
+      if (area > imgArea * 0.10 && area > maxArea) {
+        const peri = cv.arcLength(cnt, true);
+        const approx = new cv.Mat();
+        cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+
+        if (approx.rows === 4) {
+          maxArea = area;
+          maxContourIndex = i;
+          bestPoly = approx;
+        } else {
+          approx.delete();
+        }
+      }
+    }
+
+    if (maxContourIndex >= 0 && bestPoly) {
+      const pts = [];
+      for (let i = 0; i < 4; i++) {
+        pts.push({
+          x: bestPoly.data32S[i * 2],
+          y: bestPoly.data32S[i * 2 + 1]
+        });
+      }
+      bestPoly.delete();
+
+      // Ordenar 4 puntos: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]
+      pts.sort((a, b) => a.y - b.y);
+      const topPts = [pts[0], pts[1]].sort((a, b) => a.x - b.x);
+      const botPts = [pts[2], pts[3]].sort((a, b) => a.x - b.x);
+
+      const tl = topPts[0];
+      const tr = topPts[1];
+      const br = botPts[1];
+      const bl = botPts[0];
+
+      // Dimensiones del rectángulo de salida
+      const widthA = Math.hypot(br.x - bl.x, br.y - bl.y);
+      const widthB = Math.hypot(tr.x - tl.x, tr.y - tl.y);
+      const maxWidth = Math.max(widthA, widthB);
+
+      const heightA = Math.hypot(tr.x - br.x, tr.y - br.y);
+      const heightB = Math.hypot(tl.x - bl.x, tl.y - bl.y);
+      const maxHeight = Math.max(heightA, heightB);
+
+      if (maxWidth < 100 || maxHeight < 100) {
+        src.delete(); gray.delete(); blur.delete(); edges.delete();
+        contours.delete(); hierarchy.delete();
+        return false;
+      }
+
+      const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+        tl.x, tl.y,
+        tr.x, tr.y,
+        br.x, br.y,
+        bl.x, bl.y
+      ]);
+      const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+        0, 0,
+        maxWidth - 1, 0,
+        maxWidth - 1, maxHeight - 1,
+        0, maxHeight - 1
+      ]);
+
+      // Transformación de perspectiva estilo Adobe Scan
+      const M = cv.getPerspectiveTransform(srcTri, dstTri);
+      const dst = new cv.Mat();
+      const dsize = new cv.Size(maxWidth, maxHeight);
+      cv.warpPerspective(src, dst, M, dsize);
+
+      // Renderizar resultado en canvas de salida
+      dstCanvas.width = maxWidth;
+      dstCanvas.height = maxHeight;
+      cv.imshow(dstCanvas, dst);
+
+      // Limpieza de memoria WebAssembly
+      src.delete(); gray.delete(); blur.delete(); edges.delete();
+      contours.delete(); hierarchy.delete(); srcTri.delete();
+      dstTri.delete(); M.delete(); dst.delete();
+
+      return true; // Éxito en recorte y enderezado estilo Adobe Scan
+    }
+
+    src.delete(); gray.delete(); blur.delete(); edges.delete();
+    contours.delete(); hierarchy.delete();
+    return false;
+
+  } catch (err) {
+    console.warn('Fallback OpenCV autoCrop:', err);
+    return false;
+  }
 }
 
 /**
@@ -524,11 +766,22 @@ async function handlePDFUpload(e) {
     const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
     const numPages = pdfDoc.numPages;
 
-    resetScanBuffer();
-    updateProcessingProgress(`Procesando ${numPages} páginas del PDF...`, 30);
+    state.detectedIndexPages = [];
 
     for (let pageNum = 1; pageNum <= numPages; pageNum++) {
       const page = await pdfDoc.getPage(pageNum);
+
+      // Buscar texto del índice en la página mediante PDF.js
+      try {
+        const textContent = await page.getTextContent();
+        const textStr = textContent.items.map(item => item.str).join(' ').toUpperCase();
+        if (textStr.includes('ÍNDICE') || textStr.includes('INDICE') || textStr.includes('TABLA DE CONTENIDOS') || textStr.includes('CONTENIDOS') || textStr.includes('SUMARIO') || textStr.includes('INDEX')) {
+          state.detectedIndexPages.push(pageNum - 1); // 0-indexed
+        }
+      } catch (e) {
+        // Ignorar si el PDF no tiene capa de texto libre
+      }
+
       const viewport = page.getViewport({ scale: 1.2 });
       
       const canvas = document.createElement('canvas');
@@ -548,7 +801,7 @@ async function handlePDFUpload(e) {
       state.bookPagesBase64.push(base64);
 
       const pct = 30 + Math.floor((pageNum / numPages) * 50);
-      updateProcessingProgress(`Renderizando hoja ${pageNum} de ${numPages}...`, pct);
+      updateProcessingProgress(`Renderizando y analizando página ${pageNum} de ${numPages}...`, pct);
     }
 
     updatePageCounter();
@@ -655,6 +908,51 @@ function resetScanBuffer() {
   renderThumbnails();
 }
 
+// ========== HELPER DE COMPRESIÓN DE IMÁGENES PARA PAYLOAD IA (MAX 800PX) ==========
+async function resizeBase64ForAi(base64Str, maxDim = 800) {
+  // Timeout de 8 segundos para evitar que onload se congele en Android WebView
+  return Promise.race([
+    new Promise((resolve) => {
+      try {
+        const img = new Image();
+        img.src = 'data:image/jpeg;base64,' + base64Str;
+        img.onload = () => {
+          try {
+            let w = img.width;
+            let h = img.height;
+            if (w > maxDim || h > maxDim) {
+              if (w > h) {
+                h = Math.round((h * maxDim) / w);
+                w = maxDim;
+              } else {
+                w = Math.round((w * maxDim) / h);
+                h = maxDim;
+              }
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, w, h);
+            const resizedDataUrl = canvas.toDataURL('image/jpeg', 0.75);
+            resolve(resizedDataUrl.split(',')[1]);
+          } catch (canvasErr) {
+            console.warn('Canvas resize falló, usando original:', canvasErr);
+            resolve(base64Str);
+          }
+        };
+        img.onerror = () => resolve(base64Str);
+      } catch (e) {
+        resolve(base64Str);
+      }
+    }),
+    new Promise((resolve) => setTimeout(() => {
+      console.warn('resizeBase64ForAi: timeout de 8s alcanzado, usando imagen original');
+      resolve(base64Str);
+    }, 8000))
+  ]);
+}
+
 // ========== PROCESAMIENTO CON GEMINI AI REAL ==========
 async function processBookWithGeminiAI() {
   if (state.bookPagesBuffer.length === 0) {
@@ -666,72 +964,112 @@ async function processBookWithGeminiAI() {
   showProcessingOverlay('Enviando portadas a Google Gemini AI...', 10);
 
   try {
-    // Tomar las primeras 4 hojas para análisis de metadatos (portada, créditos)
-    const pagesToAnalyze = Math.min(state.bookPagesBase64.length, 4);
-    updateProcessingProgress('Analizando metadatos del libro con Inteligencia Artificial...', 35);
+    // Enviar TODAS las páginas del libro a la IA para lectura completa
+    const totalBookPages = state.bookPagesBase64.length;
+
+    updateProcessingProgress(`Comprimiendo ${totalBookPages} páginas para IA...`, 15);
 
     const imageParts = [];
-    for (let i = 0; i < pagesToAnalyze; i++) {
-      imageParts.push({
-        inline_data: {
-          mime_type: 'image/jpeg',
-          data: state.bookPagesBase64[i]
-        }
-      });
+    for (let i = 0; i < totalBookPages; i++) {
+      try {
+        // Comprimir a 600px y calidad 0.5 para que quepan todas las páginas
+        const compressedB64 = await resizeBase64ForAi(state.bookPagesBase64[i], 600);
+        imageParts.push({
+          inline_data: {
+            mime_type: 'image/jpeg',
+            data: compressedB64
+          }
+        });
+      } catch (e) {
+        imageParts.push({
+          inline_data: {
+            mime_type: 'image/jpeg',
+            data: state.bookPagesBase64[i]
+          }
+        });
+      }
+      // Actualizar progreso cada 5 páginas
+      if (i % 5 === 0) {
+        updateProcessingProgress(`Comprimiendo página ${i + 1} de ${totalBookPages}...`, 15 + Math.round((i / totalBookPages) * 25));
+      }
     }
+
+    updateProcessingProgress(`Enviando ${imageParts.length} páginas completas a Gemini AI...`, 45);
 
     const extractionPrompt = {
       contents: [{
         parts: [
           ...imageParts,
           {
-            text: `You are a librarian expert. Look at these scanned book images carefully. Read ALL text visible in ANY language (English, Spanish, French, etc). Extract bibliographic metadata.
+            text: `Eres un bibliotecario experto y catalogador MARC21. Se te proporcionan TODAS las ${totalPages} páginas escaneadas de un libro. Examínalas con máximo detalle.
 
-CRITICAL RULES:
-- READ the title, authors, publisher, year, ISBN from the cover and credits pages
-- The book may be in ANY language - read it in its original language
-- If you see text like "AUTHORS:", "AUTORES:", read the names listed below
-- If you see a publisher logo or name, extract it
-- numero_paginas MUST be "${totalPages} p."
-- For palabras_clave, generate 3-5 keywords based on the book topic
-- For resumen, write a 1-2 sentence summary of what the book appears to be about
-- NEVER leave titulo_principal empty - always put the main title you see
-- Respond ONLY with valid JSON, no markdown, no explanation
+REGLAS ESTRICTAS PARA TABLA DE CONTENIDOS / ÍNDICE (tabla_contenidos):
+1. BUSCA en TODAS las imágenes proporcionadas cualquier página titulada "ÍNDICE", "CONTENIDO", "TABLA DE CONTENIDOS", "SUMARIO", "INDEX", "TABLE OF CONTENTS".
+2. SI ENCUENTRAS una página de índice/contenido en el documento, TRANSCRÍBELA EXACTAMENTE tal como aparece en la imagen, LÍNEA POR LÍNEA, SIN MODIFICAR NADA, SIN INVENTAR NADA. Copia cada título de capítulo, sección, subsección y número de página exactamente como está escrito.
+3. SOLO SI NO EXISTE ninguna página de índice en todo el documento, ENTONCES genera un índice estructurado basándote en los títulos de capítulos y secciones que veas EN LAS PÁGINAS PROPORCIONADAS. NO inventes títulos ni secciones que no existan en el documento.
+4. NUNCA inventes contenido. Solo transcribe lo que ves o genera basándote estrictamente en lo visible.
 
-Exact JSON format:
+REGLAS DE EXTRACCIÓN DE CAMPOS:
+- titulo: Título principal del documento (exacto como aparece en la portada)
+- autor_principal: Autor principal formato "Apellido, Nombre"
+- colaboradores: Coautores, editores, ilustradores (separados por | si hay varios)
+- lugar_publicacion: Ciudad y/o país de publicación
+- editorial: Nombre de la editorial
+- anio_publicacion: Año de publicación o copyright
+- descripcion_fisica: Descripción física ej. "${totalPages} pág. 27 cm"
+- notas_fisicas: Condición física o características del ejemplar
+- tipo_material: Tipo de material (por defecto "Texto")
+- temas: Descriptores o palabras clave del contenido (separados por |)
+- clasificacion: Código de clasificación si es visible
+- resumen: Resumen breve del contenido del documento
+- tabla_contenidos: Índice/Tabla de contenidos (TRANSCRITA EXACTA si existe, o generada si no existe)
+
+Responde SOLO con JSON válido, sin formato markdown, sin bloques de código.
+
 {
   "isbn": "",
-  "titulo_principal": "",
+  "titulo": "",
   "subtitulo": "",
   "autor_principal": "",
-  "autores_secundarios": "",
+  "colaboradores": "",
   "lugar_publicacion": "",
   "editorial": "",
   "anio_publicacion": "",
-  "numero_paginas": "${totalPages} p.",
-  "palabras_clave": "",
-  "resumen": ""
+  "descripcion_fisica": "${totalPages} pág. 27 cm",
+  "notas_fisicas": "",
+  "tipo_material": "Texto",
+  "temas": "",
+  "clasificacion": "",
+  "resumen": "",
+  "tabla_contenidos": ""
 }`
           }
         ]
       }],
       generationConfig: {
-        temperature: 0.2,
-        maxOutputTokens: 1500
+        temperature: 0.1,
+        maxOutputTokens: 16384
       }
     };
 
     updateProcessingProgress('Gemini AI estructurando registro MARC21...', 65);
 
+    const apiKeys = getApiKeys();
+    if (!apiKeys || apiKeys.length === 0) {
+      throw new Error('No se ha configurado ninguna Clave API de Google Gemini. Por favor configure su clave en el ícono de llave (🔑) del encabezado.');
+    }
     let response = null;
     let lastError = '';
-    const maxAttempts = 3;
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Buche de rotación automática: prueba cada clave API si la anterior agota su cuota
+    for (let kAttempt = 0; kAttempt < apiKeys.length; kAttempt++) {
+      const activeIdx = (state.currentKeyIndex + kAttempt) % apiKeys.length;
+      const currentKey = apiKeys[activeIdx];
+
       for (const model of GEMINI_MODELS) {
         try {
           const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-          const res = await fetch(`${apiUrl}?key=${getApiKey()}`, {
+          const res = await fetch(`${apiUrl}?key=${currentKey}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(extractionPrompt)
@@ -739,12 +1077,14 @@ Exact JSON format:
 
           if (res.ok) {
             response = res;
+            state.currentKeyIndex = activeIdx; // Guardar clave activa exitosa
             break;
           } else {
             const errData = await res.json().catch(() => ({}));
             lastError = errData?.error?.message || `Error ${res.status}`;
-            if (res.status === 429) {
-              updateProcessingProgress(`Servidor Google Gemini ocupado. Reintentando (${attempt}/${maxAttempts})...`, 70);
+            if (res.status === 429 || res.status === 403) {
+              const nextNum = ((activeIdx + 1) % apiKeys.length) + 1;
+              updateProcessingProgress(`Clave #${activeIdx + 1} en límite. Rotando automáticamente a Clave #${nextNum}...`, 75);
             }
           }
         } catch (err) {
@@ -753,22 +1093,20 @@ Exact JSON format:
       }
 
       if (response) break;
-
-      if (attempt < maxAttempts) {
-        // Pausa de 3 segundos para refrescar la cuota por minuto de Google
-        await new Promise(r => setTimeout(r, 3000));
-      }
     }
 
     if (!response) {
-      alert(`⚠️ Límite temporal de consultas de Google alcanzado:\n\nGoogle Gemini reportó límite de velocidad por minuto (HTTP 429).\n\nEspere 30 segundos y vuelva a presionar 'Compilar y Generar PDF' para reintentar la extracción de metadatos.`);
-      throw new Error(`No se pudo conectar con Gemini AI: ${lastError}`);
+      console.warn('Gemini API no disponible en ninguna clave:', lastError);
+      throw new Error(`Conexión Gemini: ${lastError}`);
     }
 
     let extracted = {};
     if (response) {
       const data = await response.json().catch(() => ({}));
-      const aiText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      let aiText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      
+      // Limpiar bloques de código markdown que Gemini a veces envuelve (```json ... ```)
+      aiText = aiText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
       
       // Intentar extraer bloque JSON con regex
       const jsonMatch = aiText.match(/\{[\s\S]*\}/);
@@ -783,7 +1121,7 @@ Exact JSON format:
 
     updateProcessingProgress('Generando archivo PDF del libro digitalizado...', 90);
 
-    const bookTitle = (extracted.titulo_principal || '').trim() || 'Documento_Digitalizado_CIESPAL';
+    const bookTitle = (extracted.titulo || extracted.titulo_principal || '').trim() || 'Documento_Digitalizado_CIESPAL';
     const sanitizedName = bookTitle.replace(/[\\/*?:"<>|]/g, '').replace(/\s+/g, '_');
     
     const record = {
@@ -792,13 +1130,18 @@ Exact JSON format:
       titulo_principal: bookTitle,
       subtitulo: extracted.subtitulo || '',
       autor_principal: extracted.autor_principal || '',
-      autores_secundarios: extracted.autores_secundarios || '',
+      colaboradores: extracted.colaboradores || extracted.autores_secundarios || '',
       lugar_publicacion: extracted.lugar_publicacion || '',
       editorial: extracted.editorial || '',
       anio_publicacion: extracted.anio_publicacion || '',
-      numero_paginas: extracted.numero_paginas || `${totalPages} p.`,
-      palabras_clave: extracted.palabras_clave || '',
+      descripcion_fisica: extracted.descripcion_fisica || `${totalPages} pág. 27 cm`,
+      notas_fisicas: extracted.notas_fisicas || '',
+      tipo_material: extracted.tipo_material || 'Texto',
+      temas: extracted.temas || extracted.palabras_clave || '',
+      clasificacion: extracted.clasificacion || '',
       resumen: extracted.resumen || '',
+      tabla_contenidos: extracted.tabla_contenidos || '',
+      url_recurso_en_linea: `${sanitizedName}.pdf`,
       enlace_documento: `${sanitizedName}.pdf`
     };
 
@@ -815,7 +1158,11 @@ Exact JSON format:
 
   } catch (err) {
     hideProcessingOverlay();
-    console.warn('Procesamiento completado con plantilla por defecto:', err);
+    console.error('Error en procesamiento con IA:', err);
+    
+    // Mostrar el error real al usuario en vez de fallar silenciosamente
+    const errorMsg = err.message || 'Error desconocido';
+    alert(`⚠️ Error al procesar con IA:\n${errorMsg}\n\nSe cargará una plantilla vacía para completar manualmente.`);
     
     // Guardar hojas antes de resetear
     state.savedPagesBase64 = [...state.bookPagesBase64];
@@ -826,13 +1173,18 @@ Exact JSON format:
       titulo_principal: 'Documento_Digitalizado_CIESPAL',
       subtitulo: '',
       autor_principal: '',
-      autores_secundarios: '',
-      lugar_publicacion: 'Quito, Ecuador',
-      editorial: 'CIESPAL',
-      anio_publicacion: new Date().getFullYear().toString(),
-      numero_paginas: `${totalPages} p.`,
-      palabras_clave: 'CIESPAL, Mediateca',
-      resumen: 'Documento digitalizado.',
+      colaboradores: '',
+      lugar_publicacion: '',
+      editorial: '',
+      anio_publicacion: '',
+      descripcion_fisica: `${totalPages} pág. 27 cm`,
+      notas_fisicas: '',
+      tipo_material: 'Texto',
+      temas: '',
+      clasificacion: '',
+      resumen: '',
+      tabla_contenidos: '',
+      url_recurso_en_linea: 'Documento_Digitalizado_CIESPAL.pdf',
       enlace_documento: 'Documento_Digitalizado_CIESPAL.pdf'
     };
 
@@ -869,11 +1221,15 @@ function onBookScanCompleted(record, totalPages) {
   document.getElementById('field-editorial').value = record.editorial || '';
   document.getElementById('field-lugar').value = record.lugar_publicacion || '';
   document.getElementById('field-anio').value = record.anio_publicacion || '';
-  document.getElementById('field-paginas').value = record.numero_paginas || `${totalPages} p.`;
-  document.getElementById('field-pdf-url').value = record.enlace_documento || '';
-  document.getElementById('field-autores-sec').value = record.autores_secundarios || '';
-  document.getElementById('field-palabras-clave').value = record.palabras_clave || '';
+  document.getElementById('field-paginas').value = record.descripcion_fisica || record.numero_paginas || `${totalPages} pág. 27 cm`;
+  document.getElementById('field-pdf-url').value = record.url_recurso_en_linea || record.enlace_documento || '';
+  document.getElementById('field-notas-fisicas').value = record.notas_fisicas || '';
+  document.getElementById('field-tipo-material').value = record.tipo_material || 'Texto';
+  document.getElementById('field-clasificacion').value = record.clasificacion || '';
+  document.getElementById('field-autores-sec').value = record.colaboradores || record.autores_secundarios || '';
+  document.getElementById('field-palabras-clave').value = record.temas || record.palabras_clave || '';
   document.getElementById('field-resumen').value = record.resumen || '';
+  document.getElementById('field-tabla-contenidos').value = record.tabla_contenidos || '';
 
   const sanitizedPdfName = (record.titulo_principal || 'Documento_Digitalizado')
     .replace(/[\\/*?:"<>|]/g, '').replace(/\s+/g, '_') + '.pdf';
@@ -1019,11 +1375,19 @@ async function handleFormSubmit(e) {
     editorial: document.getElementById('field-editorial').value,
     lugar_publicacion: document.getElementById('field-lugar').value,
     anio_publicacion: document.getElementById('field-anio').value,
+    descripcion_fisica: document.getElementById('field-paginas').value,
     numero_paginas: document.getElementById('field-paginas').value,
+    url_recurso_en_linea: sanitizedPdfName,
     enlace_documento: sanitizedPdfName,
+    notas_fisicas: document.getElementById('field-notas-fisicas').value,
+    tipo_material: document.getElementById('field-tipo-material').value,
+    clasificacion: document.getElementById('field-clasificacion').value,
+    colaboradores: document.getElementById('field-autores-sec').value,
     autores_secundarios: document.getElementById('field-autores-sec').value,
+    temas: document.getElementById('field-palabras-clave').value,
     palabras_clave: document.getElementById('field-palabras-clave').value,
-    resumen: document.getElementById('field-resumen').value
+    resumen: document.getElementById('field-resumen').value,
+    tabla_contenidos: document.getElementById('field-tabla-contenidos').value
   };
 
   const idx = state.records.findIndex(r => r.id === updatedRecord.id);
@@ -1068,28 +1432,65 @@ window.editRecord = function(id) {
   if (rec) onBookScanCompleted(rec, parseInt(rec.numero_paginas) || 0);
 };
 
-// ========== EXPORTACIÓN Y DESCARGA DE CSV KOHA MARC21 ==========
+// ========== EXPORTACIÓN Y DESCARGA CSV KOHA MARC21 ==========
 async function downloadKohaCSV() {
   if (state.records.length === 0) {
     alert('No hay registros para exportar.');
     return;
   }
 
-  const headers = ['020a','100a','245a','245b','700a','264a','264b','264c','300a','520a','650a','856u'];
-  let csv = '\uFEFF' + headers.join(',') + '\n';
+  const headers = [
+    'titulo', 'autor_principal', 'colaboradores', 'lugar_publicacion',
+    'editorial', 'anio_publicacion', 'descripcion_fisica', 'notas_fisicas',
+    'tipo_material', 'temas', 'clasificacion', 'resumen',
+    'tabla_contenidos', 'url_recurso_en_linea'
+  ];
+
+  // Usar coma (,) como separador estándar universal para Google Sheets y Excel
+  const sep = ',';
+  let csv = '\uFEFF' + headers.map(h => `"${h}"`).join(sep) + '\n';
 
   state.records.forEach(rec => {
     csv += [
-      esc(rec.isbn), esc(rec.autor_principal), esc(rec.titulo_principal),
-      esc(rec.subtitulo), esc(rec.autores_secundarios), esc(rec.lugar_publicacion),
-      esc(rec.editorial), esc(rec.anio_publicacion), esc(rec.numero_paginas),
-      esc(rec.resumen), esc(rec.palabras_clave), esc(rec.enlace_documento)
-    ].join(',') + '\n';
+      escCsv(rec.titulo_principal),
+      escCsv(rec.autor_principal),
+      escCsv(rec.colaboradores || rec.autores_secundarios),
+      escCsv(rec.lugar_publicacion),
+      escCsv(rec.editorial),
+      escCsv(rec.anio_publicacion),
+      escCsv(rec.descripcion_fisica || rec.numero_paginas),
+      escCsv(rec.notas_fisicas),
+      escCsv(rec.tipo_material || 'Texto'),
+      escCsv(rec.temas || rec.palabras_clave),
+      escCsv(rec.clasificacion),
+      escCsv(rec.resumen),
+      escCsv(rec.tabla_contenidos),
+      escCsv(rec.url_recurso_en_linea || rec.enlace_documento)
+    ].join(sep) + '\n';
   });
 
-  const filename = `ciespal_koha_marc21_${new Date().toISOString().slice(0,10)}.csv`;
+  // Nombre del archivo = Nombre real del libro escaneado
+  let rawTitle = '';
+  if (state.records.length === 1) {
+    rawTitle = state.records[0].titulo_principal || 'Documento_CIESPAL';
+  } else if (state.currentRecord?.titulo_principal) {
+    rawTitle = state.currentRecord.titulo_principal;
+  } else if (state.records.length > 1) {
+    rawTitle = `${state.records[0].titulo_principal || 'Lote'}_y_${state.records.length - 1}_libros`;
+  } else {
+    rawTitle = 'Catalogo_CIESPAL';
+  }
 
-  // Convertir string UTF-8 a Base64
+  // Sanitizar nombre de archivo para Android y Windows (quitar caracteres prohibidos)
+  const cleanTitle = rawTitle
+    .trim()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // Quitar acentos para compatibilidad máxima de archivo
+    .replace(/[\\/*?:"<>|]/g, '')
+    .replace(/\s+/g, '_')
+    .substring(0, 80);
+
+  const filename = `${cleanTitle}.csv`;
+
   const utf8Bytes = new TextEncoder().encode(csv);
   let binary = '';
   for (let i = 0; i < utf8Bytes.byteLength; i++) {
@@ -1097,11 +1498,20 @@ async function downloadKohaCSV() {
   }
   const base64Data = btoa(binary);
 
-  // Activar notificación en la barra superior de Android
   triggerAndroidSystemDownload(base64Data, filename, 'text/csv');
 }
 
-function esc(str) {
-  if (!str) return '""';
-  return `"${str.replace(/"/g, '""')}"`;
+/**
+ * Formatea y escapa cadenas para CSV cumpliendo el estándar RFC 4180.
+ * Las celdas se ajustan al texto sin cortar filas ni comprimir datos.
+ */
+function escCsv(str) {
+  if (str === null || str === undefined || str === '') return '""';
+  // Normalizar saltos de línea y escapar comillas dobles (") como ("")
+  const cleanStr = String(str)
+    .trim()
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/"/g, '""');
+  return `"${cleanStr}"`;
 }

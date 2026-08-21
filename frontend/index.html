@@ -41,6 +41,7 @@
           <div class="camera-header">
             <span class="badge"><i data-lucide="camera"></i> Digitalizador CIESPAL</span>
             <div class="camera-actions">
+              <button class="icon-btn" id="btn-filter-mode" title="Filtro Document Scanner (Realce / B/N / Original)"><i data-lucide="wand-2"></i></button>
               <button class="icon-btn" id="btn-toggle-camera" title="Cambiar Cámara"><i data-lucide="refresh-cw"></i></button>
               <button class="icon-btn" id="btn-flash" title="Iluminación"><i data-lucide="zap"></i></button>
             </div>
@@ -126,63 +127,97 @@
 
         <form id="marc-form" class="marc-form">
           <div class="form-grid">
-            <div class="form-group col-12">
-              <label><span class="marc-tag">245 $a</span> Título Principal de la Obra (Nombre del PDF) *</label>
-              <input type="text" id="field-titulo" required class="form-control">
+            
+            <div class="form-section-title">📌 Identificación de la Obra</div>
+
+            <div class="form-group">
+              <label><span class="marc-tag">245 $a</span> Título Principal (titulo) *</label>
+              <input type="text" id="field-titulo" required class="form-control" placeholder="Título completo de la obra">
             </div>
 
-            <div class="form-group col-12">
+            <div class="form-group">
               <label><span class="marc-tag">245 $b</span> Subtítulo o Información Secundaria</label>
-              <input type="text" id="field-subtitulo" class="form-control">
+              <input type="text" id="field-subtitulo" class="form-control" placeholder="Subtítulo si aplica">
             </div>
 
-            <div class="form-group col-6">
-              <label><span class="marc-tag">100 $a</span> Autor Principal (Apellidos, Nombres)</label>
-              <input type="text" id="field-autor" required class="form-control">
+            <div class="form-group">
+              <label><span class="marc-tag">100 $a</span> Autor Principal (autor_principal)</label>
+              <input type="text" id="field-autor" required class="form-control" placeholder="Apellido, Nombre (ej. Nordenstreng, K.)">
             </div>
 
-            <div class="form-group col-6">
+            <div class="form-group">
+              <label><span class="marc-tag">700 $a</span> Colaboradores / Coautores (colaboradores)</label>
+              <input type="text" id="field-autores-sec" class="form-control" placeholder="separados por | (ej. Varis, T. | Pérez, J.)">
+            </div>
+
+            <div class="form-section-title">🏢 Publicación y Descripción Física</div>
+
+            <div class="form-group">
+              <label><span class="marc-tag">264 $a</span> Lugar de Publicación (lugar_publicacion)</label>
+              <input type="text" id="field-lugar" placeholder="Ciudad / País (ej. París)" class="form-control">
+            </div>
+
+            <div class="form-group">
+              <label><span class="marc-tag">264 $b</span> Editorial o Entidad (editorial)</label>
+              <input type="text" id="field-editorial" placeholder="Editorial (ej. Editorial de la UNESCO)" class="form-control">
+            </div>
+
+            <div class="form-group">
+              <label><span class="marc-tag">264 $c</span> Año de Publicación (anio_publicacion)</label>
+              <input type="text" id="field-anio" placeholder="Año (ej. 1976)" class="form-control">
+            </div>
+
+            <div class="form-group">
+              <label><span class="marc-tag">300 $a, $c</span> Descripción Física (descripcion_fisica)</label>
+              <input type="text" id="field-paginas" placeholder="ej. 72 pág. Libro rústico. 27 cm" class="form-control">
+            </div>
+
+            <div class="form-group">
+              <label><span class="marc-tag">500 $a</span> Notas Físicas (notas_fisicas)</label>
+              <input type="text" id="field-notas-fisicas" placeholder="ej. Libro rústico de pasta dura, manchada" class="form-control">
+            </div>
+
+            <div class="form-group">
+              <label><span class="marc-tag">Naturaleza</span> Tipo de Material (tipo_material)</label>
+              <input type="text" id="field-tipo-material" value="Texto" class="form-control">
+            </div>
+
+            <div class="form-section-title">📚 Indexación y Clasificación</div>
+
+            <div class="form-group">
               <label><span class="marc-tag">020 $a</span> ISBN / ISSN / DOI</label>
-              <input type="text" id="field-isbn" class="form-control">
+              <input type="text" id="field-isbn" placeholder="ISBN si existe" class="form-control">
             </div>
 
-            <div class="form-group col-6">
-              <label><span class="marc-tag">264 $b</span> Editorial / Entidad</label>
-              <input type="text" id="field-editorial" class="form-control">
+            <div class="form-group">
+              <label><span class="marc-tag">090 $a</span> Signatura / Clasificación (clasificacion)</label>
+              <input type="text" id="field-clasificacion" placeholder="ej. N832" class="form-control">
             </div>
 
-            <div class="form-group col-6">
-              <label><span class="marc-tag">264 $a / $c</span> Lugar y Año</label>
-              <div class="dual-input">
-                <input type="text" id="field-lugar" placeholder="Ciudad" class="form-control">
-                <input type="text" id="field-anio" placeholder="Año" class="form-control">
-              </div>
+            <div class="form-group">
+              <label><span class="marc-tag">650 $a</span> Temas y Descriptores (temas)</label>
+              <input type="text" id="field-palabras-clave" placeholder="separados por | (ej. Comunicaciones | Telecomunicaciones)" class="form-control">
             </div>
 
-            <div class="form-group col-6">
-              <label><span class="marc-tag">300 $a</span> Extensión Física (Páginas totales)</label>
-              <input type="text" id="field-paginas" class="form-control">
+            <div class="form-group">
+              <label><span class="marc-tag">520 $a</span> Resumen (resumen)</label>
+              <textarea id="field-resumen" rows="3" class="form-control" placeholder="Síntesis o abstract del documento..."></textarea>
             </div>
 
-            <div class="form-group col-6">
-              <label><span class="marc-tag">856 $u</span> Enlace al PDF Digitalizado</label>
+            <div class="form-section-title">📖 Índice / Tabla de Contenidos</div>
+
+            <div class="form-group">
+              <label><span class="marc-tag">505 $a</span> Tabla de Contenidos (tabla_contenidos)</label>
+              <textarea id="field-tabla-contenidos" rows="5" placeholder="Índice del documento (extraído o sintetizado por IA)..." class="form-control"></textarea>
+            </div>
+
+            <div class="form-section-title">🔗 Recurso Digital Koha</div>
+
+            <div class="form-group">
+              <label><span class="marc-tag">856 $u</span> Enlace Archivo (url_recurso_en_linea)</label>
               <input type="text" id="field-pdf-url" class="form-control" readonly>
             </div>
 
-            <div class="form-group col-12">
-              <label><span class="marc-tag">700 $a</span> Autores Secundarios / Colaboradores</label>
-              <input type="text" id="field-autores-sec" class="form-control">
-            </div>
-
-            <div class="form-group col-12">
-              <label><span class="marc-tag">650 $a</span> Palabras Clave / Descriptores</label>
-              <input type="text" id="field-palabras-clave" class="form-control">
-            </div>
-
-            <div class="form-group col-12">
-              <label><span class="marc-tag">520 $a</span> Resumen (Abstract de la Obra)</label>
-              <textarea id="field-resumen" rows="3" class="form-control"></textarea>
-            </div>
           </div>
 
           <div class="form-actions">
@@ -302,6 +337,8 @@
     </nav>
   </div>
 
+  <!-- OpenCV.js for Adobe Scan / CamScanner style document 4-corner perspective auto-crop -->
+  <script src="public/opencv.js" async></script>
   <script src="config.js"></script>
   <script src="app.js"></script>
   <script>

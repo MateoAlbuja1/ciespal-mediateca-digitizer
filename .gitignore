@@ -1,4 +1,8 @@
+# Dependencies
 node_modules/
+frontend/node_modules/
+
+# Android and Build Artifacts
 .gradle/
 build/
 *.apk
@@ -6,7 +10,20 @@ frontend/www/
 frontend/android/app/build/
 frontend/android/.gradle/
 frontend/android/build/
-frontend/node_modules/
-.DS_Store
-*.log
+frontend/android/app/src/main/assets/public/
+
+# Secret and API Key Configuration Files (Security & Ethics)
+.env
+*.env
+.env.*
+config.js
+**/config.js
 frontend/config.js
+frontend/www/config.js
+
+# Logs and OS files
+*.log
+.DS_Store
+Thumbs.db
+scratch/
+
