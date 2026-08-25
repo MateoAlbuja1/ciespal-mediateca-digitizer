@@ -11,6 +11,8 @@ frontend/android/app/build/
 frontend/android/.gradle/
 frontend/android/build/
 frontend/android/app/src/main/assets/public/
+frontend/dist/
+frontend/android/local.properties
 
 # Secret and API Key Configuration Files (Security & Ethics)
 .env
