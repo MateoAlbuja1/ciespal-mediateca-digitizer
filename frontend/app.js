@@ -1413,7 +1413,7 @@ function renderKohaRecordsTable() {
     return;
   }
 
-  state.records.forEach(rec => {
+  state.records.forEach((rec, idx) => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td><code>${rec.isbn || '-'}</code></td>
@@ -1421,7 +1421,10 @@ function renderKohaRecordsTable() {
       <td>${rec.autor_principal}</td>
       <td>${rec.numero_paginas || '-'}</td>
       <td><code style="font-size:0.6rem;">${rec.enlace_documento}</code></td>
-      <td><button class="btn-secondary" style="padding:4px 8px;font-size:0.68rem;" onclick="editRecord('${rec.id}')">Editar</button></td>
+      <td style="display:flex;gap:4px;flex-direction:column;">
+        <button class="btn-secondary" style="padding:4px 8px;font-size:0.68rem;" onclick="editRecord('${rec.id}')">Editar</button>
+        <button class="btn-primary" style="padding:4px 8px;font-size:0.68rem;" onclick="downloadSingleCSV('${rec.id}', ${idx})">CSV</button>
+      </td>
     `;
     tbody.appendChild(tr);
   });
@@ -1432,6 +1435,12 @@ window.editRecord = function(id) {
   if (rec) onBookScanCompleted(rec, parseInt(rec.numero_paginas) || 0);
 };
 
+window.downloadSingleCSV = async function(id, index = 0) {
+  const rec = state.records.find(r => r.id === id);
+  if (!rec) return;
+  await generateAndDownloadCSV(rec, index);
+};
+
 // ========== EXPORTACIÓN Y DESCARGA CSV KOHA MARC21 ==========
 async function downloadKohaCSV() {
   if (state.records.length === 0) {
@@ -1439,87 +1448,79 @@ async function downloadKohaCSV() {
     return;
   }
 
-  // Formato vertical tipo Ficha Bibliográfica CSV: Columna A = Campo MARC21, Columna B = Valor
+  // Descargar cada registro como un CSV independiente
+  for (let recIdx = 0; recIdx < state.records.length; recIdx++) {
+    await generateAndDownloadCSV(state.records[recIdx], recIdx);
+    // Pequeña pausa entre descargas múltiples
+    if (state.records.length > 1 && recIdx < state.records.length - 1) {
+      await new Promise(r => setTimeout(r, 800));
+    }
+  }
+}
+
+async function generateAndDownloadCSV(rec, index = 0) {
   const sep = ';';
   let csv = '\uFEFF';
 
-  state.records.forEach((rec, recIdx) => {
-    // Encabezado del libro
-    csv += escCsv('FICHA BIBLIOGRÁFICA MARC21') + sep + escCsv(rec.titulo_principal || 'Documento Digitalizado') + '\n';
-    csv += sep + '\n';
+  // Encabezado del libro
+  csv += escCsv('FICHA BIBLIOGRÁFICA MARC21') + sep + escCsv(rec.titulo_principal || 'Documento Digitalizado') + '\n';
+  csv += sep + '\n';
 
-    // Sección: Identificación de la Obra
-    csv += escCsv('IDENTIFICACIÓN DE LA OBRA') + sep + '\n';
-    csv += escCsv('020a — ISBN') + sep + escCsv(rec.isbn) + '\n';
-    csv += escCsv('245a — Título') + sep + escCsv(rec.titulo_principal) + '\n';
-    csv += escCsv('245b — Subtítulo') + sep + escCsv(rec.subtitulo) + '\n';
-    csv += escCsv('100a — Autor Principal') + sep + escCsv(rec.autor_principal) + '\n';
-    csv += escCsv('700a — Colaboradores') + sep + escCsv(rec.colaboradores || rec.autores_secundarios) + '\n';
-    csv += sep + '\n';
+  // Sección: Identificación de la Obra
+  csv += escCsv('IDENTIFICACIÓN DE LA OBRA') + sep + '\n';
+  csv += escCsv('020a — ISBN') + sep + escCsv(rec.isbn) + '\n';
+  csv += escCsv('245a — Título') + sep + escCsv(rec.titulo_principal) + '\n';
+  csv += escCsv('245b — Subtítulo') + sep + escCsv(rec.subtitulo) + '\n';
+  csv += escCsv('100a — Autor Principal') + sep + escCsv(rec.autor_principal) + '\n';
+  csv += escCsv('700a — Colaboradores') + sep + escCsv(rec.colaboradores || rec.autores_secundarios) + '\n';
+  csv += sep + '\n';
 
-    // Sección: Publicación y Descripción Física
-    csv += escCsv('PUBLICACIÓN Y DESCRIPCIÓN FÍSICA') + sep + '\n';
-    csv += escCsv('264a — Lugar de Publicación') + sep + escCsv(rec.lugar_publicacion) + '\n';
-    csv += escCsv('264b — Editorial') + sep + escCsv(rec.editorial) + '\n';
-    csv += escCsv('264c — Año de Publicación') + sep + escCsv(rec.anio_publicacion) + '\n';
-    csv += escCsv('300a — Descripción Física') + sep + escCsv(rec.descripcion_fisica || rec.numero_paginas) + '\n';
-    csv += escCsv('500a — Notas Físicas') + sep + escCsv(rec.notas_fisicas) + '\n';
-    csv += escCsv('Naturaleza — Tipo de Material') + sep + escCsv(rec.tipo_material || 'Texto') + '\n';
-    csv += sep + '\n';
+  // Sección: Publicación y Descripción Física
+  csv += escCsv('PUBLICACIÓN Y DESCRIPCIÓN FÍSICA') + sep + '\n';
+  csv += escCsv('264a — Lugar de Publicación') + sep + escCsv(rec.lugar_publicacion) + '\n';
+  csv += escCsv('264b — Editorial') + sep + escCsv(rec.editorial) + '\n';
+  csv += escCsv('264c — Año de Publicación') + sep + escCsv(rec.anio_publicacion) + '\n';
+  csv += escCsv('300a — Descripción Física') + sep + escCsv(rec.descripcion_fisica || rec.numero_paginas) + '\n';
+  csv += escCsv('500a — Notas Físicas') + sep + escCsv(rec.notas_fisicas) + '\n';
+  csv += escCsv('Naturaleza — Tipo de Material') + sep + escCsv(rec.tipo_material || 'Texto') + '\n';
+  csv += sep + '\n';
 
-    // Sección: Indexación y Clasificación
-    csv += escCsv('INDEXACIÓN Y CLASIFICACIÓN') + sep + '\n';
-    csv += escCsv('650a — Temas') + sep + escCsv(rec.temas || rec.palabras_clave) + '\n';
-    csv += escCsv('090a — Clasificación') + sep + escCsv(rec.clasificacion) + '\n';
-    csv += escCsv('520a — Resumen') + sep + escCsv(rec.resumen) + '\n';
-    csv += sep + '\n';
+  // Sección: Indexación y Clasificación
+  csv += escCsv('INDEXACIÓN Y CLASIFICACIÓN') + sep + '\n';
+  csv += escCsv('650a — Temas') + sep + escCsv(rec.temas || rec.palabras_clave) + '\n';
+  csv += escCsv('090a — Clasificación') + sep + escCsv(rec.clasificacion) + '\n';
+  csv += escCsv('520a — Resumen') + sep + escCsv(rec.resumen) + '\n';
+  csv += sep + '\n';
 
-    // Sección: Tabla de Contenidos (cada entrada en su propia fila, de arriba hacia abajo)
-    csv += escCsv('TABLA DE CONTENIDOS') + sep + '\n';
-    const tocText = rec.tabla_contenidos || '';
-    const tocEntries = tocText.split(/[\n\r|]+/).map(l => l.trim()).filter(l => l.length > 0);
-    if (tocEntries.length > 0) {
-      csv += escCsv('505a — Índice') + sep + escCsv(tocEntries[0]) + '\n';
-      for (let i = 1; i < tocEntries.length; i++) {
-        csv += escCsv('') + sep + escCsv(tocEntries[i]) + '\n';
-      }
-    } else {
-      csv += escCsv('505a — Índice') + sep + escCsv('') + '\n';
+  // Sección: Tabla de Contenidos
+  csv += escCsv('TABLA DE CONTENIDOS') + sep + '\n';
+  const tocText = rec.tabla_contenidos || '';
+  const tocEntries = tocText.split(/[\n\r|]+/).map(l => l.trim()).filter(l => l.length > 0);
+  if (tocEntries.length > 0) {
+    csv += escCsv('505a — Índice') + sep + escCsv(tocEntries[0]) + '\n';
+    for (let i = 1; i < tocEntries.length; i++) {
+      csv += escCsv('') + sep + escCsv(tocEntries[i]) + '\n';
     }
-    csv += sep + '\n';
-
-    // Sección: Recurso Digital
-    csv += escCsv('RECURSO DIGITAL KOHA') + sep + '\n';
-    csv += escCsv('856u — Enlace al Documento') + sep + escCsv(rec.url_recurso_en_linea || rec.enlace_documento) + '\n';
-
-    // Separador entre libros si hay más de uno
-    if (recIdx < state.records.length - 1) {
-      csv += sep + '\n';
-      csv += sep + '\n';
-    }
-  });
-
-  // Nombre del archivo = Nombre real del libro escaneado
-  let rawTitle = '';
-  if (state.records.length === 1) {
-    rawTitle = state.records[0].titulo_principal || 'Documento_CIESPAL';
-  } else if (state.currentRecord?.titulo_principal) {
-    rawTitle = state.currentRecord.titulo_principal;
-  } else if (state.records.length > 1) {
-    rawTitle = `${state.records[0].titulo_principal || 'Lote'}_y_${state.records.length - 1}_libros`;
   } else {
-    rawTitle = 'Catalogo_CIESPAL';
+    csv += escCsv('505a — Índice') + sep + escCsv('') + '\n';
   }
+  csv += sep + '\n';
 
-  // Sanitizar nombre de archivo para Android y Windows (quitar caracteres prohibidos)
+  // Sección: Recurso Digital
+  csv += escCsv('RECURSO DIGITAL KOHA') + sep + '\n';
+  csv += escCsv('856u — Enlace al Documento') + sep + escCsv(rec.url_recurso_en_linea || rec.enlace_documento) + '\n';
+
+  const rawTitle = rec.titulo_principal || `Documento_CIESPAL_${index+1}`;
   const cleanTitle = rawTitle
     .trim()
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/[\\/*?:"<>|]/g, '')
     .replace(/\s+/g, '_')
-    .substring(0, 80);
+    .substring(0, 70);
 
-  const filename = `${cleanTitle}.csv`;
+  // Generamos un timestamp corto o usamos el indice para garantizar que nunca se sobreescriba
+  const ts = new Date().getTime().toString().slice(-4);
+  const filename = `${cleanTitle}_${ts}.csv`;
 
   const utf8Bytes = new TextEncoder().encode(csv);
   let binary = '';
