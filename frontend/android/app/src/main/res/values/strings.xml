@@ -2,6 +2,4 @@
 <resources>
     <string name="app_name">CIESPAL Mediateca</string>
     <string name="title_activity_main">CIESPAL Mediateca</string>
-    <string name="package_name">org.ciespal.mediateca.digitizer</string>
-    <string name="custom_url_scheme">org.ciespal.mediateca.digitizer</string>
 </resources>

@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
 frontend/node_modules/
+.venv/
 
 # Android and Build Artifacts
 .gradle/
@@ -14,10 +15,17 @@ frontend/android/app/src/main/assets/public/
 frontend/dist/
 frontend/android/local.properties
 
+# Python and runtime artifacts
+__pycache__/
+*.pyc
+backend/uploads/
+
 # Secret and API Key Configuration Files (Security & Ethics)
 .env
 *.env
 .env.*
+!.env.example
+!**/.env.example
 config.js
 **/config.js
 frontend/config.js
@@ -28,4 +36,3 @@ frontend/www/config.js
 .DS_Store
 Thumbs.db
 scratch/
-

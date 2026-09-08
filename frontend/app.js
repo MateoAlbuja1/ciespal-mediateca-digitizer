@@ -1,32 +1,39 @@
 /**
- * CIESPAL Mediateca - Digitalizador con IA Real (Google Gemini)
+ * CIESPAL Mediateca - Digitalizador con IA directa DeepSeek
  * Estilo CamScanner con Previsualización, Reorganización, Repetición de Hojas y Carga de PDF.
  */
 
-// Sistema de Gestión y Rotación Automática de Múltiples Claves API (Google Gemini)
-function getApiKeys() {
-  const stored = localStorage.getItem('ciespal_gemini_keys');
-  if (stored) {
-    const keys = stored.split(/[\n,;]/).map(k => k.trim()).filter(k => k.length > 8);
-    if (keys.length > 0) return keys;
-  }
-  if (window.ENV_GEMINI_API_KEYS && Array.isArray(window.ENV_GEMINI_API_KEYS) && window.ENV_GEMINI_API_KEYS.length > 0) {
-    return window.ENV_GEMINI_API_KEYS.filter(k => k && k.length > 8);
-  }
-  if (window.ENV_GEMINI_API_KEY && window.ENV_GEMINI_API_KEY.length > 8) {
-    return [window.ENV_GEMINI_API_KEY];
-  }
-  return [];
-}
+const DEEPSEEK_CONFIG = {
+  keyStorage: 'ciespal_deepseek_api_key',
+  apiUrl: 'https://api.deepseek.com/chat/completions',
+  modelsUrl: 'https://api.deepseek.com/models',
+  visionModel: 'deepseek-v4-flash-vision-exp',
+  maxDirectPages: 12
+};
 
-function getApiKey() {
-  const keys = getApiKeys();
-  if (keys.length === 0) return '';
-  const idx = (state.currentKeyIndex || 0) % keys.length;
-  return keys[idx];
-}
+const SCAN_CONFIG = {
+  usePerspectiveWarp: false,
+  liveDetectionIntervalMs: 520,
+  liveDetectionStableFrames: 3
+};
 
-const GEMINI_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
+const DRAFT_CONFIG = {
+  dbName: 'ciespal_digitizer_drafts',
+  storeName: 'drafts',
+  key: 'active_scan',
+  version: 1,
+  debounceMs: 700
+};
+
+const CROP_CORNERS = ['tl', 'tr', 'br', 'bl'];
+
+const CIESPAL_KOHA_PROFILE = {
+  branchId: 'BIB1',
+  itemType: 'BK',
+  classificationSource: 'ddc',
+  resourceLabel: 'Recuperar PDF',
+  includeItemFields: false
+};
 
 // Configuración de PDF.js para renderizar PDFs subidos
 if (window.pdfjsLib) {
@@ -39,7 +46,6 @@ const state = {
   bookPagesBuffer: [],
   bookPagesBase64: [],
   detectedIndexPages: [],
-  currentKeyIndex: 0,       // Índice para rotación automática de claves API
   scanFilterMode: 'magic_color', // 'magic_color' (Fondo Blanco Inteligente), 'bw' (B/N OpenCV), 'original'
   cameraStream: null,
   cameraReady: false,
@@ -47,21 +53,35 @@ const state = {
   retakeIndex: null,
   savedPagesBase64: [],
   activeModalIndex: null,
+  activeRecordId: null,
   detectedBounds: null,     // Bordes detectados del documento en tiempo real
-  liveDetectionRAF: null    // requestAnimationFrame ID para detección en vivo
+  liveDetectionRAF: null,   // requestAnimationFrame ID para detección en vivo
+  liveDetectionLastRun: 0,
+  liveDetectionCanvas: null,
+  liveDetectionStableCandidate: null,
+  liveDetectionPendingCandidate: null,
+  liveDetectionPendingCount: 0,
+  liveDetectionMisses: 0,
+  cropEditor: null,
+  draftSaveTimer: null,
+  draftLoaded: false,
+  deepSeekKeyModalResolve: null
 };
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   initNavigation();
   initEvents();
+  refreshDeepSeekKeyButton();
+  await restoreDraft();
   renderKohaRecordsTable();
-  
-  // Iniciar cámara con delay para el WebView
-  setTimeout(() => { requestCameraPermission(); }, 400);
+  updatePageCounter();
+  renderThumbnails();
+  initScannerSurface();
 });
 
 // ========== NAVEGACIÓN ==========
 function initNavigation() {
+  updateCaptureModeClass('screen-capture');
   document.querySelectorAll('.nav-item').forEach(item => {
     item.addEventListener('click', () => {
       const targetId = item.getAttribute('data-target');
@@ -69,13 +89,38 @@ function initNavigation() {
       item.classList.add('active');
       document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
       document.getElementById(targetId)?.classList.add('active');
+      updateCaptureModeClass(targetId);
     });
   });
+}
+
+function updateCaptureModeClass(activeScreenId) {
+  document.getElementById('app')?.classList.remove('capture-mode');
+}
+
+function initScannerSurface() {
+  stopLiveDocumentDetection();
+  if (state.cameraStream) {
+    state.cameraStream.getTracks().forEach(track => track.stop());
+    state.cameraStream = null;
+  }
+  state.cameraReady = false;
+
+  const hint = document.getElementById('scan-hint');
+  if (!hint || state.bookPagesBase64.length || state.records.length) return;
+
+  hint.textContent = hasNativeDocumentScanner()
+    ? 'Presione Escanear para capturar hojas con recorte automático.'
+    : 'Instale el APK en Android o use Cargar PDF para procesar documentos.';
 }
 
 // ========== CÁMARA NATIVA ==========
 async function requestCameraPermission() {
   const hint = document.getElementById('scan-hint');
+  if (!document.getElementById('camera-video')) {
+    if (hint) hint.textContent = 'Escaneo directo con ML Kit. Use Escanear.';
+    return;
+  }
   hint.textContent = 'Iniciando cámara...';
   
   try {
@@ -93,9 +138,14 @@ async function requestCameraPermission() {
 async function startCamera() {
   const video = document.getElementById('camera-video');
   const hint = document.getElementById('scan-hint');
+  if (!video) {
+    if (hint) hint.textContent = 'Escaneo directo con ML Kit. Use Escanear.';
+    return;
+  }
   
   try {
     if (state.cameraStream) {
+      stopLiveDocumentDetection();
       state.cameraStream.getTracks().forEach(t => t.stop());
       state.cameraStream = null;
     }
@@ -118,6 +168,7 @@ async function startCamera() {
     
     await video.play();
     state.cameraReady = true;
+    startLiveDocumentDetection();
     
     if (state.retakeIndex !== null) {
       hint.textContent = `MODO REPETIR: Tome la nueva foto para la Hoja #${state.retakeIndex + 1}`;
@@ -128,23 +179,38 @@ async function startCamera() {
   } catch (err) {
     console.error('Error cámara:', err);
     state.cameraReady = false;
+    stopLiveDocumentDetection();
     hint.textContent = 'Use "Cargar PDF" para subir y procesar un libro.';
   }
 }
 
 // ========== EVENTOS ==========
 function initEvents() {
-  document.getElementById('btn-shutter').addEventListener('click', capturePagePhoto);
-  document.getElementById('btn-finish-pdf').addEventListener('click', processBookWithGeminiAI);
+  document.getElementById('btn-shutter').addEventListener('click', startSmartDocumentScan);
+  document.getElementById('btn-finish-pdf').addEventListener('click', processBookWithDeepSeekAI);
   document.getElementById('pdf-fallback').addEventListener('change', handlePDFUpload);
-  
-  document.getElementById('btn-toggle-camera').addEventListener('click', () => {
-    state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
-    startCamera();
+  document.getElementById('btn-ai-key')?.addEventListener('click', () => configureDeepSeekKey());
+  document.getElementById('btn-close-ai-key')?.addEventListener('click', () => closeDeepSeekKeyModal(getDeepSeekApiKey()));
+  document.getElementById('btn-cancel-ai-key')?.addEventListener('click', () => closeDeepSeekKeyModal(getDeepSeekApiKey()));
+  document.getElementById('btn-save-ai-key')?.addEventListener('click', saveDeepSeekKeyFromModal);
+  document.getElementById('btn-test-ai-key')?.addEventListener('click', testDeepSeekKeyFromModal);
+  document.getElementById('btn-delete-ai-key')?.addEventListener('click', deleteDeepSeekKeyFromModal);
+  document.getElementById('btn-toggle-ai-key')?.addEventListener('click', toggleDeepSeekKeyVisibility);
+  document.getElementById('ai-key-input')?.addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      saveDeepSeekKeyFromModal();
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeDeepSeekKeyModal(getDeepSeekApiKey());
+    }
   });
-  
+
   document.getElementById('marc-form').addEventListener('submit', handleFormSubmit);
   document.getElementById('btn-download-csv').addEventListener('click', downloadKohaCSV);
+  document.getElementById('btn-download-excel')?.addEventListener('click', downloadKohaExcel);
+  document.getElementById('btn-download-marcxml')?.addEventListener('click', downloadKohaMARCXML);
   document.getElementById('btn-discard')?.addEventListener('click', () => {
     if (confirm('¿Descartar el escaneo actual?')) {
       resetScanBuffer();
@@ -152,29 +218,29 @@ function initEvents() {
     }
   });
 
-  // Selector de Filtro de Imagen (Realce / B/N OpenCV / Original)
-  const btnFilter = document.getElementById('btn-filter-mode');
-  if (btnFilter) {
-    const modes = ['magic_color', 'bw', 'original'];
-    const modeNames = {
-      'magic_color': 'Filtro: ✨ Realce Inteligente (Fondo Blanco Limpio)',
-      'bw': 'Filtro: 📄 B/N Nítido (OpenCV Adaptive Threshold)',
-      'original': 'Filtro: 📸 Color Original'
-    };
-    btnFilter.addEventListener('click', () => {
-      const curr = state.scanFilterMode || 'magic_color';
-      const nextIdx = (modes.indexOf(curr) + 1) % modes.length;
-      state.scanFilterMode = modes[nextIdx];
-      const hint = document.getElementById('scan-hint');
-      if (hint) hint.textContent = modeNames[state.scanFilterMode];
-      alert(modeNames[state.scanFilterMode]);
-    });
-  }
-
-  // Modal de Previsualización / Repetición
+  // Modal de previsualización del lote
   document.getElementById('btn-close-modal').addEventListener('click', closeModal);
   document.getElementById('btn-delete-page').addEventListener('click', deleteCurrentModalPage);
-  document.getElementById('btn-retake-page').addEventListener('click', prepareRetakeFromModal);
+  document.getElementById('btn-add-more-pages')?.addEventListener('click', () => {
+    closeModal();
+    startSmartDocumentScan();
+  });
+  document.getElementById('btn-retake-page')?.addEventListener('click', prepareRetakeFromModal);
+  document.getElementById('btn-edit-page-crop')?.addEventListener('click', openCropEditorForCurrentPage);
+  document.getElementById('btn-modal-prev-page')?.addEventListener('click', () => moveModalPage(-1));
+  document.getElementById('btn-modal-next-page')?.addEventListener('click', () => moveModalPage(1));
+
+  // Guardado automático de borradores
+  document.getElementById('marc-form')?.addEventListener('input', () => {
+    if (!state.currentRecord) return;
+    state.currentRecord = collectRecordFromForm(state.currentRecord);
+    scheduleDraftSave();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) saveDraftNow();
+  });
+
+  window.addEventListener('ciespal-document-scan-result', handleNativeDocumentScanResult);
 }
 
 // ========== HELPER DE CONVERSIÓN DE IMAGEN ==========
@@ -192,6 +258,1189 @@ function dataURLToBlob(dataurl) {
   } catch (e) {
     return new Blob([], { type: 'image/jpeg' });
   }
+}
+
+function sanitizeFilename(name) {
+  return (name || 'Documento_Digitalizado_CIESPAL')
+    .trim()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\\/*?:"<>|]/g, '')
+    .replace(/\s+/g, '_')
+    .substring(0, 80) || 'Documento_Digitalizado_CIESPAL';
+}
+
+function imageBase64ToBlob(base64) {
+  return dataURLToBlob(`data:image/jpeg;base64,${base64}`);
+}
+
+// ========== BORRADOR LOCAL PERSISTENTE ==========
+function openDraftDb() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) {
+      reject(new Error('IndexedDB no disponible'));
+      return;
+    }
+
+    const request = indexedDB.open(DRAFT_CONFIG.dbName, DRAFT_CONFIG.version);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(DRAFT_CONFIG.storeName)) {
+        db.createObjectStore(DRAFT_CONFIG.storeName);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('No se pudo abrir el borrador'));
+  });
+}
+
+async function readDraftFromDb() {
+  const db = await openDraftDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DRAFT_CONFIG.storeName, 'readonly');
+    const request = tx.objectStore(DRAFT_CONFIG.storeName).get(DRAFT_CONFIG.key);
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error || new Error('No se pudo leer el borrador'));
+    tx.oncomplete = () => db.close();
+  });
+}
+
+async function writeDraftToDb(draft) {
+  const db = await openDraftDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DRAFT_CONFIG.storeName, 'readwrite');
+    tx.objectStore(DRAFT_CONFIG.storeName).put(draft, DRAFT_CONFIG.key);
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error || new Error('No se pudo guardar el borrador'));
+    };
+  });
+}
+
+function serializeDraft() {
+  return {
+    savedAt: new Date().toISOString(),
+    records: state.records || [],
+    currentRecord: state.currentRecord || null,
+    activeRecordId: state.activeRecordId || state.currentRecord?.id || state.records?.[0]?.id || null,
+    bookPagesBase64: state.bookPagesBase64 || [],
+    savedPagesBase64: state.savedPagesBase64 || [],
+    detectedIndexPages: state.detectedIndexPages || [],
+    scanFilterMode: state.scanFilterMode || 'magic_color'
+  };
+}
+
+async function restoreDraft() {
+  try {
+    const draft = await readDraftFromDb();
+    if (!draft) return;
+
+    state.records = Array.isArray(draft.records) ? draft.records : [];
+    state.currentRecord = draft.currentRecord || null;
+    state.activeRecordId = draft.activeRecordId || state.currentRecord?.id || state.records[0]?.id || null;
+    state.bookPagesBase64 = Array.isArray(draft.bookPagesBase64) ? draft.bookPagesBase64 : [];
+    state.savedPagesBase64 = Array.isArray(draft.savedPagesBase64) ? draft.savedPagesBase64 : [];
+    state.detectedIndexPages = Array.isArray(draft.detectedIndexPages) ? draft.detectedIndexPages : [];
+    state.scanFilterMode = draft.scanFilterMode || state.scanFilterMode || 'magic_color';
+    collapseRecordsToActiveDraft();
+    state.bookPagesBuffer = state.bookPagesBase64.map(imageBase64ToBlob);
+    state.draftLoaded = true;
+
+    if (state.currentRecord) {
+      populateRecordForm(state.currentRecord, state.savedPagesBase64.length || state.bookPagesBase64.length || 0);
+    }
+
+    const totalPages = state.bookPagesBase64.length;
+    const hint = document.getElementById('scan-hint');
+    if (hint && (totalPages || state.records.length)) {
+      hint.textContent = `Borrador recuperado: ${totalPages} hojas y ${state.records.length} registros.`;
+    }
+    scheduleDraftSave();
+  } catch (err) {
+    console.warn('No se pudo restaurar el borrador local:', err);
+  }
+}
+
+function scheduleDraftSave() {
+  clearTimeout(state.draftSaveTimer);
+  state.draftSaveTimer = setTimeout(() => {
+    saveDraftNow();
+  }, DRAFT_CONFIG.debounceMs);
+}
+
+function collapseRecordsToActiveDraft() {
+  const records = Array.isArray(state.records) ? state.records.filter(Boolean) : [];
+  const active = records.find(rec => rec.id && rec.id === state.activeRecordId)
+    || state.currentRecord
+    || records[0]
+    || null;
+
+  if (!active) {
+    clearRecordState({ resetForm: false });
+    return;
+  }
+
+  if (!active.id) active.id = 'ciespal_' + Date.now().toString(36);
+  state.currentRecord = active;
+  state.activeRecordId = active.id;
+  state.records = [active];
+}
+
+function setActiveRecord(record) {
+  if (!record) return;
+  if (!record.id) record.id = 'ciespal_' + Date.now().toString(36);
+  state.currentRecord = record;
+  state.activeRecordId = record.id;
+  state.records = [record];
+}
+
+function clearRecordState(options = {}) {
+  state.currentRecord = null;
+  state.records = [];
+  state.activeRecordId = null;
+
+  const badge = document.getElementById('record-id-badge');
+  if (badge) badge.textContent = 'ID: --';
+
+  const pdfCard = document.getElementById('pdf-generated-card');
+  if (pdfCard) pdfCard.classList.add('hidden');
+
+  if (options.resetForm !== false) {
+    document.getElementById('marc-form')?.reset();
+  }
+}
+
+async function saveDraftNow() {
+  clearTimeout(state.draftSaveTimer);
+  state.draftSaveTimer = null;
+  try {
+    await writeDraftToDb(serializeDraft());
+  } catch (err) {
+    console.warn('No se pudo guardar el borrador local:', err);
+  }
+}
+
+function getDeepSeekApiKey() {
+  return (localStorage.getItem(DEEPSEEK_CONFIG.keyStorage) || '').trim();
+}
+
+function maskApiKey(key) {
+  if (!key) return 'sin configurar';
+  if (key.length <= 12) return 'configurada';
+  return `${key.slice(0, 5)}...${key.slice(-4)}`;
+}
+
+function refreshDeepSeekKeyButton() {
+  const btn = document.getElementById('btn-ai-key');
+  if (!btn) return;
+  const key = getDeepSeekApiKey();
+  btn.classList.toggle('is-configured', Boolean(key));
+  btn.title = key
+    ? `Key DeepSeek configurada (${maskApiKey(key)})`
+    : 'Configurar key DeepSeek';
+  const aiStatus = document.getElementById('home-ai-status');
+  if (aiStatus) aiStatus.textContent = key ? 'Lista' : 'Sin key';
+}
+
+async function configureDeepSeekKey(options = {}) {
+  const currentKey = getDeepSeekApiKey();
+  const modal = document.getElementById('ai-key-modal');
+  const input = document.getElementById('ai-key-input');
+  const current = document.getElementById('ai-key-current');
+  const status = document.getElementById('ai-key-status');
+
+  if (!modal || !input) {
+    return configureDeepSeekKeyFallback(options);
+  }
+
+  if (state.deepSeekKeyModalResolve) closeDeepSeekKeyModal(currentKey);
+
+  return new Promise(resolve => {
+    state.deepSeekKeyModalResolve = resolve;
+    modal.dataset.skipTest = options.skipTest ? '1' : '0';
+    input.value = '';
+    input.type = 'password';
+    if (current) current.textContent = currentKey
+      ? `Key actual: ${maskApiKey(currentKey)}`
+      : 'Sin key guardada';
+    if (status) {
+      status.className = 'ai-key-status';
+      status.textContent = currentKey
+        ? 'Pegue una nueva key o conserve la actual.'
+        : 'La key se guarda solo en este celular.';
+    }
+    setDeepSeekKeyModalBusy(false);
+    setDeepSeekKeyVisibility(false);
+    modal.classList.remove('hidden');
+    setTimeout(() => input.focus(), 80);
+  });
+}
+
+async function ensureDeepSeekApiKey() {
+  const currentKey = getDeepSeekApiKey();
+  if (currentKey) return currentKey;
+
+  const configuredKey = await configureDeepSeekKey();
+  if (configuredKey) return configuredKey;
+
+  alert('Para usar IA sin backend, toque el icono de llave y pegue su key de DeepSeek.');
+  return '';
+}
+
+async function configureDeepSeekKeyFallback(options = {}) {
+  const currentKey = getDeepSeekApiKey();
+  const value = window.prompt('Pegue su API key de DeepSeek para usar la IA.', '');
+  if (value === null) return currentKey;
+
+  const cleaned = value.trim();
+  if (!cleaned) return currentKey;
+
+  if (/^(borrar|delete|eliminar|quitar)$/i.test(cleaned)) {
+    localStorage.removeItem(DEEPSEEK_CONFIG.keyStorage);
+    refreshDeepSeekKeyButton();
+    return '';
+  }
+
+  localStorage.setItem(DEEPSEEK_CONFIG.keyStorage, cleaned);
+  refreshDeepSeekKeyButton();
+
+  if (!options.skipTest) {
+    try {
+      await testDeepSeekKey(cleaned);
+    } catch (err) {
+      console.warn('No se pudo probar la key DeepSeek:', err);
+    }
+  }
+
+  return cleaned;
+}
+
+function closeDeepSeekKeyModal(value) {
+  const modal = document.getElementById('ai-key-modal');
+  if (modal) modal.classList.add('hidden');
+  setDeepSeekKeyModalBusy(false);
+  const resolver = state.deepSeekKeyModalResolve;
+  state.deepSeekKeyModalResolve = null;
+  if (resolver) resolver(value || '');
+}
+
+function setDeepSeekKeyVisibility(visible) {
+  const input = document.getElementById('ai-key-input');
+  const toggle = document.getElementById('btn-toggle-ai-key');
+  if (!input || !toggle) return;
+  input.type = visible ? 'text' : 'password';
+  toggle.innerHTML = `<i data-lucide="${visible ? 'eye-off' : 'eye'}"></i>`;
+  if (window.lucide) lucide.createIcons();
+}
+
+function toggleDeepSeekKeyVisibility() {
+  const input = document.getElementById('ai-key-input');
+  setDeepSeekKeyVisibility(input?.type === 'password');
+}
+
+function setDeepSeekKeyModalBusy(isBusy) {
+  ['btn-save-ai-key', 'btn-test-ai-key', 'btn-delete-ai-key', 'btn-cancel-ai-key', 'btn-close-ai-key', 'btn-toggle-ai-key']
+    .forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.disabled = isBusy;
+    });
+}
+
+function getDeepSeekKeyInputValue() {
+  return (document.getElementById('ai-key-input')?.value || '').trim();
+}
+
+function setDeepSeekKeyStatus(text, tone = '') {
+  const status = document.getElementById('ai-key-status');
+  if (!status) return;
+  status.className = ['ai-key-status', tone ? `is-${tone}` : ''].filter(Boolean).join(' ');
+  status.textContent = text;
+}
+
+async function saveDeepSeekKeyFromModal() {
+  const cleaned = getDeepSeekKeyInputValue();
+  if (!cleaned) {
+    closeDeepSeekKeyModal(getDeepSeekApiKey());
+    return;
+  }
+
+  localStorage.setItem(DEEPSEEK_CONFIG.keyStorage, cleaned);
+  refreshDeepSeekKeyButton();
+  setDeepSeekKeyStatus('Key guardada correctamente.', 'success');
+  setTimeout(() => closeDeepSeekKeyModal(cleaned), 250);
+}
+
+async function testDeepSeekKeyFromModal() {
+  const cleaned = getDeepSeekKeyInputValue() || getDeepSeekApiKey();
+  if (!cleaned) {
+    setDeepSeekKeyStatus('Pegue una key antes de probar.', 'error');
+    return;
+  }
+
+  setDeepSeekKeyModalBusy(true);
+  setDeepSeekKeyStatus('Probando conexión con DeepSeek...');
+  try {
+    await testDeepSeekKey(cleaned);
+    localStorage.setItem(DEEPSEEK_CONFIG.keyStorage, cleaned);
+    refreshDeepSeekKeyButton();
+    setDeepSeekKeyStatus('Key probada y guardada correctamente.', 'success');
+  } catch (err) {
+    console.warn('No se pudo probar la key DeepSeek:', err);
+    setDeepSeekKeyStatus(getDeepSeekDirectErrorMessage(err), 'error');
+  } finally {
+    setDeepSeekKeyModalBusy(false);
+  }
+}
+
+function deleteDeepSeekKeyFromModal() {
+  localStorage.removeItem(DEEPSEEK_CONFIG.keyStorage);
+  refreshDeepSeekKeyButton();
+  const input = document.getElementById('ai-key-input');
+  if (input) input.value = '';
+  setDeepSeekKeyStatus('Key eliminada de este celular.', 'success');
+  closeDeepSeekKeyModal('');
+}
+
+async function testDeepSeekKey(apiKey) {
+  const result = await deepSeekHttpRequest(DEEPSEEK_CONFIG.modelsUrl, {
+    method: 'GET',
+    apiKey,
+    timeoutMs: 30000
+  });
+
+  if (!result.ok) {
+    throw new Error(`DeepSeek respondió ${result.status}: ${extractDeepSeekError(result.data || result.text)}`);
+  }
+
+  const models = Array.isArray(result.data?.data) ? result.data.data.map(model => model.id) : [];
+  if (!models.includes(DEEPSEEK_CONFIG.visionModel)) {
+    throw new Error(`La key responde, pero no aparece el modelo ${DEEPSEEK_CONFIG.visionModel}.`);
+  }
+
+  return true;
+}
+
+function startLiveDocumentDetection() {
+  const video = document.getElementById('camera-video');
+  if (!video) return;
+
+  stopLiveDocumentDetection(true);
+  state.liveDetectionLastRun = 0;
+
+  const tick = (now) => {
+    if (!state.cameraReady || !video.videoWidth || document.hidden) {
+      state.liveDetectionRAF = requestAnimationFrame(tick);
+      return;
+    }
+
+    if (now - state.liveDetectionLastRun > SCAN_CONFIG.liveDetectionIntervalMs) {
+      state.liveDetectionLastRun = now;
+      const candidate = updateLiveDocumentStability(detectLiveDocumentCandidate(video));
+      if (candidate) {
+        state.detectedBounds = candidate;
+        drawLiveDocumentOverlay(candidate, video);
+      } else {
+        state.detectedBounds = null;
+        clearLiveDocumentOverlay();
+      }
+    }
+
+    state.liveDetectionRAF = requestAnimationFrame(tick);
+  };
+
+  state.liveDetectionRAF = requestAnimationFrame(tick);
+}
+
+function stopLiveDocumentDetection(clear = true) {
+  if (state.liveDetectionRAF) {
+    cancelAnimationFrame(state.liveDetectionRAF);
+    state.liveDetectionRAF = null;
+  }
+  state.detectedBounds = null;
+  state.liveDetectionStableCandidate = null;
+  state.liveDetectionPendingCandidate = null;
+  state.liveDetectionPendingCount = 0;
+  state.liveDetectionMisses = 0;
+  if (clear) clearLiveDocumentOverlay();
+}
+
+function detectLiveDocumentCandidate(video) {
+  const rawW = video.videoWidth;
+  const rawH = video.videoHeight;
+  if (!rawW || !rawH) return null;
+
+  const sampleW = Math.min(360, rawW);
+  const sampleH = Math.max(1, Math.round(rawH * (sampleW / rawW)));
+  const canvas = state.liveDetectionCanvas || document.createElement('canvas');
+  state.liveDetectionCanvas = canvas;
+  canvas.width = sampleW;
+  canvas.height = sampleH;
+
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(video, 0, 0, sampleW, sampleH);
+
+  const bounds = detectForegroundBookBounds2D(ctx, sampleW, sampleH)
+    || detectPaperSheetBounds2D(ctx, sampleW, sampleH);
+  if (!bounds) {
+    return null;
+  }
+
+  const scaleX = rawW / sampleW;
+  const scaleY = rawH / sampleH;
+  const points = boundsToPoints(bounds).map(point => ({
+    x: point.x * scaleX,
+    y: point.y * scaleY
+  }));
+
+  if (!isLiveCandidateReasonable(points, rawW, rawH)) return null;
+
+  return {
+    points,
+    method: bounds.method || 'bounds',
+    sourceWidth: rawW,
+    sourceHeight: rawH,
+    timestamp: Date.now()
+  };
+}
+
+function updateLiveDocumentStability(candidate) {
+  if (!candidate) {
+    state.liveDetectionMisses += 1;
+    if (state.liveDetectionMisses >= SCAN_CONFIG.liveDetectionStableFrames) {
+      state.liveDetectionStableCandidate = null;
+      state.liveDetectionPendingCandidate = null;
+      state.liveDetectionPendingCount = 0;
+    }
+    return state.liveDetectionStableCandidate;
+  }
+
+  state.liveDetectionMisses = 0;
+
+  if (!state.liveDetectionStableCandidate) {
+    if (candidatesSimilar(candidate, state.liveDetectionPendingCandidate)) {
+      state.liveDetectionPendingCount += 1;
+    } else {
+      state.liveDetectionPendingCandidate = candidate;
+      state.liveDetectionPendingCount = 1;
+    }
+
+    if (state.liveDetectionPendingCount >= SCAN_CONFIG.liveDetectionStableFrames) {
+      state.liveDetectionStableCandidate = candidate;
+    }
+    return state.liveDetectionStableCandidate;
+  }
+
+  if (candidatesSimilar(candidate, state.liveDetectionStableCandidate)) {
+    state.liveDetectionStableCandidate = smoothLiveCandidate(state.liveDetectionStableCandidate, candidate);
+    state.liveDetectionPendingCandidate = null;
+    state.liveDetectionPendingCount = 0;
+    return state.liveDetectionStableCandidate;
+  }
+
+  if (candidatesSimilar(candidate, state.liveDetectionPendingCandidate)) {
+    state.liveDetectionPendingCount += 1;
+  } else {
+    state.liveDetectionPendingCandidate = candidate;
+    state.liveDetectionPendingCount = 1;
+  }
+
+  if (state.liveDetectionPendingCount >= SCAN_CONFIG.liveDetectionStableFrames + 1) {
+    state.liveDetectionStableCandidate = candidate;
+    state.liveDetectionPendingCandidate = null;
+    state.liveDetectionPendingCount = 0;
+  }
+
+  return state.liveDetectionStableCandidate;
+}
+
+function candidatesSimilar(a, b) {
+  if (!a || !b) return false;
+  const boxA = pointsToBounds(a.points);
+  const boxB = pointsToBounds(b.points);
+  const iou = boundsIntersectionOverUnion(boxA, boxB);
+  const centerDistance = Math.hypot(
+    (boxA.x + boxA.w / 2) - (boxB.x + boxB.w / 2),
+    (boxA.y + boxA.h / 2) - (boxB.y + boxB.h / 2)
+  );
+  const reference = Math.max(1, Math.min(a.sourceWidth || 1, a.sourceHeight || 1));
+  return iou > 0.62 && centerDistance / reference < 0.10;
+}
+
+function smoothLiveCandidate(previous, next) {
+  const alpha = 0.32;
+  return {
+    ...next,
+    points: next.points.map((point, idx) => ({
+      x: previous.points[idx].x * (1 - alpha) + point.x * alpha,
+      y: previous.points[idx].y * (1 - alpha) + point.y * alpha
+    })),
+    timestamp: Date.now()
+  };
+}
+
+function boundsIntersectionOverUnion(a, b) {
+  if (!a || !b) return 0;
+  const left = Math.max(a.x, b.x);
+  const top = Math.max(a.y, b.y);
+  const right = Math.min(a.x + a.w, b.x + b.w);
+  const bottom = Math.min(a.y + a.h, b.y + b.h);
+  const intersection = Math.max(0, right - left) * Math.max(0, bottom - top);
+  const union = a.w * a.h + b.w * b.h - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+function drawLiveDocumentOverlay(candidate, video) {
+  const overlay = document.getElementById('edge-overlay');
+  const polygon = document.getElementById('edge-polygon');
+  const frame = document.getElementById('scan-frame');
+  const status = document.getElementById('edge-status');
+  const wrapper = document.querySelector('.viewfinder-wrapper');
+  if (!overlay || !polygon || !wrapper) return;
+
+  const viewW = wrapper.clientWidth || 1;
+  const viewH = wrapper.clientHeight || 1;
+  const mapped = mapVideoPointsToView(candidate.points, video, viewW, viewH);
+  overlay.setAttribute('viewBox', `0 0 ${viewW} ${viewH}`);
+  polygon.setAttribute('points', mapped.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' '));
+  overlay.classList.add('active');
+
+  frame?.classList.add('document-detected');
+  frame?.classList.remove('no-document');
+  if (status) {
+    status.textContent = 'Libro detectado';
+  }
+}
+
+function clearLiveDocumentOverlay() {
+  const overlay = document.getElementById('edge-overlay');
+  const polygon = document.getElementById('edge-polygon');
+  const frame = document.getElementById('scan-frame');
+  const status = document.getElementById('edge-status');
+  overlay?.classList.remove('active');
+  polygon?.setAttribute('points', '');
+  frame?.classList.remove('document-detected');
+  frame?.classList.add('no-document');
+  if (status) status.textContent = 'Buscando bordes';
+}
+
+function mapVideoPointsToView(points, video, viewW, viewH) {
+  const rawW = video.videoWidth || 1;
+  const rawH = video.videoHeight || 1;
+  const scale = Math.max(viewW / rawW, viewH / rawH);
+  const offsetX = (viewW - rawW * scale) / 2;
+  const offsetY = (viewH - rawH * scale) / 2;
+
+  return points.map(point => ({
+    x: clampNumber(point.x * scale + offsetX, 0, viewW),
+    y: clampNumber(point.y * scale + offsetY, 0, viewH)
+  }));
+}
+
+function cropFromLiveDetection(srcCanvas, dstCanvas) {
+  const candidate = state.detectedBounds;
+  if (!candidate || !candidate.points || Date.now() - candidate.timestamp > 1800) {
+    return false;
+  }
+
+  const scaleX = srcCanvas.width / (candidate.sourceWidth || srcCanvas.width);
+  const scaleY = srcCanvas.height / (candidate.sourceHeight || srcCanvas.height);
+  const points = candidate.points.map(point => ({
+    x: point.x * scaleX,
+    y: point.y * scaleY
+  }));
+
+  if (!isLiveCandidateReasonable(points, srcCanvas.width, srcCanvas.height)) {
+    return false;
+  }
+
+  if (SCAN_CONFIG.usePerspectiveWarp && candidate.method === 'polygon' && warpCanvasPerspectiveFromPoints(srcCanvas, dstCanvas, points)) {
+    return true;
+  }
+
+  renderCroppedFrame(srcCanvas, dstCanvas, pointsToBounds(points));
+  return true;
+}
+
+function warpCanvasPerspectiveFromPoints(srcCanvas, dstCanvas, points) {
+  if (typeof cv === 'undefined' || !cv.Mat || !cv.imread) return false;
+
+  let src;
+  let srcTri;
+  let dstTri;
+  let transform;
+  let dst;
+
+  try {
+    const ordered = orderDocumentPoints(points);
+    if (!ordered) return false;
+
+    const size = getPerspectiveOutputSize(ordered);
+    if (!isPerspectiveSizeValid(size, srcCanvas.width, srcCanvas.height)) return false;
+
+    src = cv.imread(srcCanvas);
+    const { tl, tr, br, bl } = ordered;
+    srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+      tl.x, tl.y,
+      tr.x, tr.y,
+      br.x, br.y,
+      bl.x, bl.y
+    ]);
+    dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+      0, 0,
+      size.width - 1, 0,
+      size.width - 1, size.height - 1,
+      0, size.height - 1
+    ]);
+
+    transform = cv.getPerspectiveTransform(srcTri, dstTri);
+    dst = new cv.Mat();
+    cv.warpPerspective(src, dst, transform, new cv.Size(size.width, size.height));
+    dstCanvas.width = size.width;
+    dstCanvas.height = size.height;
+    cv.imshow(dstCanvas, dst);
+    return true;
+  } catch (err) {
+    console.warn('Live perspective crop failed:', err);
+    return false;
+  } finally {
+    [src, srcTri, dstTri, transform, dst].forEach(mat => {
+      if (mat && typeof mat.delete === 'function') mat.delete();
+    });
+  }
+}
+
+function orderedPointsToArray(points) {
+  if (!points) return [];
+  if (!Array.isArray(points) && points.tl && points.tr && points.br && points.bl) {
+    return [points.tl, points.tr, points.br, points.bl];
+  }
+  const ordered = orderDocumentPoints(points);
+  return ordered ? [ordered.tl, ordered.tr, ordered.br, ordered.bl] : points;
+}
+
+function boundsToPoints(bounds) {
+  const x = bounds.x;
+  const y = bounds.y;
+  const right = bounds.x + bounds.w;
+  const bottom = bounds.y + bounds.h;
+  return [
+    { x, y },
+    { x: right, y },
+    { x: right, y: bottom },
+    { x, y: bottom }
+  ];
+}
+
+function pointsToBounds(points) {
+  const xs = points.map(point => point.x);
+  const ys = points.map(point => point.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  return {
+    x: minX,
+    y: minY,
+    w: maxX - minX,
+    h: maxY - minY,
+    method: 'live'
+  };
+}
+
+function isLiveCandidateReasonable(points, imgW, imgH) {
+  if (!points || points.length !== 4) return false;
+  const bounds = pointsToBounds(points);
+  if (bounds.w < imgW * 0.22 || bounds.h < imgH * 0.22) return false;
+  if (bounds.w > imgW * 0.94 && bounds.h > imgH * 0.88) return false;
+  const edgeMarginX = imgW * 0.012;
+  const edgeMarginY = imgH * 0.012;
+  const touchesAllEdges = (
+    bounds.x <= edgeMarginX &&
+    bounds.y <= edgeMarginY &&
+    bounds.x + bounds.w >= imgW - edgeMarginX &&
+    bounds.y + bounds.h >= imgH - edgeMarginY
+  );
+  if (touchesAllEdges) return false;
+
+  const areaRatio = polygonArea(points) / Math.max(1, imgW * imgH);
+  if (areaRatio < 0.08 || areaRatio > 0.88) return false;
+
+  const ordered = orderDocumentPoints(points);
+  if (!ordered) return false;
+  const size = getPerspectiveOutputSize(ordered);
+  const minSide = Math.min(size.width, size.height);
+  const maxSide = Math.max(size.width, size.height);
+  return minSide >= Math.min(imgW, imgH) * 0.18 && maxSide / Math.max(1, minSide) <= 3.4;
+}
+
+// ========== EDITOR DE RECORTE MANUAL ==========
+function getSuggestedCropForCanvas(srcCanvas, srcCtx) {
+  const w = srcCanvas.width;
+  const h = srcCanvas.height;
+  let points = null;
+  let label = 'ajuste manual';
+
+  const liveCandidate = state.detectedBounds;
+  if (liveCandidate?.points && Date.now() - liveCandidate.timestamp < 2200) {
+    const scaleX = w / (liveCandidate.sourceWidth || w);
+    const scaleY = h / (liveCandidate.sourceHeight || h);
+    const livePoints = liveCandidate.points.map(point => ({
+      x: point.x * scaleX,
+      y: point.y * scaleY
+    }));
+    if (isLiveCandidateReasonable(livePoints, w, h)) {
+      points = livePoints;
+      label = 'bordes detectados';
+    }
+  }
+
+  if (!points) {
+    const bounds = detectForegroundBookBounds2D(srcCtx, w, h)
+      || detectPaperSheetBounds2D(srcCtx, w, h)
+      || detectSmartBookBounds(srcCtx, w, h)
+      || clampBounds(null, w, h);
+    points = boundsToPoints(bounds);
+    label = bounds?.method === 'foreground'
+      ? 'libro detectado'
+      : bounds?.method === 'paper'
+        ? 'hoja detectada'
+        : 'ajuste automático';
+  }
+
+  return {
+    points: sanitizeCropPoints(points, w, h),
+    label
+  };
+}
+
+function sanitizeCropPoints(points, width, height) {
+  const fallback = boundsToPoints(clampBounds(null, width, height));
+  const ordered = orderDocumentPoints(points || fallback);
+  const array = ordered ? [ordered.tl, ordered.tr, ordered.br, ordered.bl] : fallback;
+  return array.map(point => ({
+    x: clampNumber(point.x, 0, width),
+    y: clampNumber(point.y, 0, height)
+  }));
+}
+
+function cloneCropPoints(points) {
+  return (points || []).map(point => ({ x: point.x, y: point.y }));
+}
+
+function openCropEditor({ sourceBase64, suggestedPoints, targetIndex = null, title = 'Recortar hoja', label = 'ajuste manual' }) {
+  const modal = document.getElementById('crop-modal');
+  const image = document.getElementById('crop-image');
+  const titleEl = document.getElementById('crop-modal-title');
+  if (!modal || !image) return;
+
+  state.cropEditor = {
+    sourceBase64,
+    suggestedPoints: cloneCropPoints(suggestedPoints),
+    points: cloneCropPoints(suggestedPoints),
+    targetIndex,
+    label,
+    activeCorner: null,
+    naturalWidth: 0,
+    naturalHeight: 0,
+    dragMetrics: null,
+    handleElements: null,
+    dragFrame: null
+  };
+
+  titleEl.textContent = title;
+  modal.classList.remove('hidden');
+  image.onload = () => {
+    if (!state.cropEditor) return;
+    state.cropEditor.naturalWidth = image.naturalWidth;
+    state.cropEditor.naturalHeight = image.naturalHeight;
+    if (!state.cropEditor.points.length) {
+      state.cropEditor.points = sanitizeCropPoints(null, image.naturalWidth, image.naturalHeight);
+      state.cropEditor.suggestedPoints = cloneCropPoints(state.cropEditor.points);
+    }
+    requestAnimationFrame(renderCropEditor);
+  };
+  image.src = `data:image/jpeg;base64,${sourceBase64}`;
+  document.getElementById('scan-hint').textContent = `Ajuste esquinas: ${label}.`;
+}
+
+function cancelCropEditor() {
+  document.getElementById('crop-modal')?.classList.add('hidden');
+  state.cropEditor = null;
+  document.getElementById('scan-hint').textContent = 'Recorte cancelado. Puede volver a escanear.';
+}
+
+function resetCropToSuggested() {
+  if (!state.cropEditor) return;
+  state.cropEditor.points = cloneCropPoints(state.cropEditor.suggestedPoints);
+  renderCropEditor();
+}
+
+function setCropToFullPage() {
+  if (!state.cropEditor) return;
+  const w = state.cropEditor.naturalWidth || 1;
+  const h = state.cropEditor.naturalHeight || 1;
+  const marginX = Math.round(w * 0.015);
+  const marginY = Math.round(h * 0.015);
+  state.cropEditor.points = boundsToPoints({
+    x: marginX,
+    y: marginY,
+    w: w - marginX * 2,
+    h: h - marginY * 2
+  });
+  renderCropEditor();
+}
+
+function getCropMetrics() {
+  const stage = document.getElementById('crop-stage');
+  const image = document.getElementById('crop-image');
+  if (!stage || !image || !state.cropEditor?.naturalWidth) return null;
+
+  const stageRect = stage.getBoundingClientRect();
+  const imageRect = image.getBoundingClientRect();
+  if (!stageRect.width || !stageRect.height || !imageRect.width || !imageRect.height) return null;
+
+  return {
+    stageRect,
+    imageRect,
+    imageLeft: imageRect.left - stageRect.left,
+    imageTop: imageRect.top - stageRect.top,
+    imageWidth: imageRect.width,
+    imageHeight: imageRect.height,
+    naturalWidth: state.cropEditor.naturalWidth,
+    naturalHeight: state.cropEditor.naturalHeight
+  };
+}
+
+function imagePointToStage(point, metrics) {
+  return {
+    x: metrics.imageLeft + (point.x / metrics.naturalWidth) * metrics.imageWidth,
+    y: metrics.imageTop + (point.y / metrics.naturalHeight) * metrics.imageHeight
+  };
+}
+
+function stageClientToImagePoint(clientX, clientY, metrics) {
+  const stageX = clientX - metrics.stageRect.left;
+  const stageY = clientY - metrics.stageRect.top;
+  const clampedX = clampNumber(stageX, metrics.imageLeft, metrics.imageLeft + metrics.imageWidth);
+  const clampedY = clampNumber(stageY, metrics.imageTop, metrics.imageTop + metrics.imageHeight);
+  return {
+    x: ((clampedX - metrics.imageLeft) / metrics.imageWidth) * metrics.naturalWidth,
+    y: ((clampedY - metrics.imageTop) / metrics.imageHeight) * metrics.naturalHeight
+  };
+}
+
+function renderCropEditor(metricsOverride = null) {
+  if (!state.cropEditor) return;
+  const metrics = metricsOverride || getCropMetrics();
+  if (!metrics) return;
+
+  const overlay = document.getElementById('crop-overlay');
+  const polygon = document.getElementById('crop-polygon');
+  overlay?.setAttribute('viewBox', `0 0 ${metrics.stageRect.width} ${metrics.stageRect.height}`);
+
+  const stagePoints = state.cropEditor.points.map(point => imagePointToStage(point, metrics));
+  polygon?.setAttribute('points', stagePoints.map(point => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' '));
+
+  const handles = state.cropEditor.handleElements || CROP_CORNERS.map(corner =>
+    document.querySelector(`.crop-handle[data-corner="${corner}"]`)
+  );
+
+  CROP_CORNERS.forEach((corner, idx) => {
+    const handle = handles[idx];
+    const point = stagePoints[idx];
+    if (!handle || !point) return;
+    handle.style.left = `${point.x}px`;
+    handle.style.top = `${point.y}px`;
+  });
+}
+
+function startCropHandleDrag(event) {
+  if (!state.cropEditor) return;
+  event.preventDefault();
+  const corner = event.currentTarget.dataset.corner;
+  if (!CROP_CORNERS.includes(corner)) return;
+
+  state.cropEditor.activeCorner = corner;
+  state.cropEditor.dragMetrics = getCropMetrics();
+  state.cropEditor.handleElements = CROP_CORNERS.map(c =>
+    document.querySelector(`.crop-handle[data-corner="${c}"]`)
+  );
+  event.currentTarget.setPointerCapture?.(event.pointerId);
+  document.addEventListener('pointermove', moveCropHandle, { passive: false });
+  document.addEventListener('pointerup', stopCropHandleDrag, { once: true });
+  document.addEventListener('pointercancel', stopCropHandleDrag, { once: true });
+}
+
+function moveCropHandle(event) {
+  if (!state.cropEditor?.activeCorner) return;
+  event.preventDefault();
+  const metrics = state.cropEditor.dragMetrics || getCropMetrics();
+  if (!metrics) return;
+
+  const idx = CROP_CORNERS.indexOf(state.cropEditor.activeCorner);
+  if (idx < 0) return;
+
+  state.cropEditor.points[idx] = stageClientToImagePoint(event.clientX, event.clientY, metrics);
+
+  if (state.cropEditor.dragFrame) return;
+  state.cropEditor.dragFrame = requestAnimationFrame(() => {
+    if (!state.cropEditor) return;
+    const editor = state.cropEditor;
+    editor.dragFrame = null;
+    renderCropEditor(editor.dragMetrics || metrics);
+  });
+}
+
+function stopCropHandleDrag() {
+  if (state.cropEditor) {
+    if (state.cropEditor.dragFrame) {
+      cancelAnimationFrame(state.cropEditor.dragFrame);
+      state.cropEditor.dragFrame = null;
+    }
+    state.cropEditor.activeCorner = null;
+    state.cropEditor.dragMetrics = null;
+    state.cropEditor.handleElements = null;
+    renderCropEditor();
+  }
+  document.removeEventListener('pointermove', moveCropHandle);
+}
+
+async function confirmCropSelection() {
+  const editor = state.cropEditor;
+  if (!editor?.sourceBase64) return;
+
+  try {
+    const image = await loadImageFromBase64(editor.sourceBase64);
+    const srcCanvas = document.createElement('canvas');
+    srcCanvas.width = image.naturalWidth || image.width;
+    srcCanvas.height = image.naturalHeight || image.height;
+    srcCanvas.getContext('2d').drawImage(image, 0, 0, srcCanvas.width, srcCanvas.height);
+
+    const outputCanvas = document.getElementById('photo-canvas') || document.createElement('canvas');
+    const points = sanitizeCropPoints(editor.points, srcCanvas.width, srcCanvas.height);
+    const warped = Boolean(editor.allowPerspective) && warpCanvasPerspectiveFromPoints(srcCanvas, outputCanvas, points);
+    if (!warped) {
+      renderCroppedFrame(srcCanvas, outputCanvas, pointsToBounds(points));
+    }
+
+    enhanceDocumentWithOpenCV(outputCanvas, state.scanFilterMode || 'magic_color');
+    saveProcessedPageCanvas(outputCanvas, editor.targetIndex, 'recortada manualmente');
+
+    document.getElementById('crop-modal')?.classList.add('hidden');
+    state.cropEditor = null;
+  } catch (err) {
+    console.error('Error en recorte manual:', err);
+    alert('No se pudo guardar el recorte: ' + err.message);
+  }
+}
+
+function loadImageFromBase64(base64) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('Imagen no válida'));
+    image.src = `data:image/jpeg;base64,${base64}`;
+  });
+}
+
+function saveProcessedPageCanvas(canvas, targetIndex = null, qualityLabel = 'guardada') {
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+  const base64 = dataUrl.split(',')[1];
+  const blob = dataURLToBlob(dataUrl);
+  const hint = document.getElementById('scan-hint');
+  const startsFreshLot = targetIndex === null && state.bookPagesBase64.length === 0;
+  if (startsFreshLot) clearRecordState();
+  state.savedPagesBase64 = [];
+
+  if (targetIndex !== null && targetIndex >= 0 && targetIndex < state.bookPagesBase64.length) {
+    state.bookPagesBuffer[targetIndex] = blob;
+    state.bookPagesBase64[targetIndex] = base64;
+    if (state.retakeIndex === targetIndex) state.retakeIndex = null;
+    if (hint) hint.textContent = `Hoja #${targetIndex + 1} reemplazada, ${qualityLabel}`;
+  } else {
+    state.bookPagesBuffer.push(blob);
+    state.bookPagesBase64.push(base64);
+    if (hint) hint.textContent = `Hoja #${state.bookPagesBuffer.length} guardada, ${qualityLabel}`;
+  }
+
+  updatePageCounter();
+  renderThumbnails();
+  if (startsFreshLot) renderKohaRecordsTable();
+  scheduleDraftSave();
+}
+
+function openCropEditorForCurrentPage() {
+  if (state.activeModalIndex === null || !state.bookPagesBase64[state.activeModalIndex]) return;
+  const idx = state.activeModalIndex;
+  const sourceBase64 = state.bookPagesBase64[idx];
+  closeModal();
+  openCropEditor({
+    sourceBase64,
+    suggestedPoints: [],
+    targetIndex: idx,
+    title: `Recortar hoja ${idx + 1}`,
+    label: 'recorte existente'
+  });
+}
+
+// ========== ESCÁNER NATIVO ML KIT ==========
+function hasNativeDocumentScanner() {
+  return Boolean(
+    window.CiespalDocumentScanner &&
+    typeof window.CiespalDocumentScanner.scanDocuments === 'function'
+  );
+}
+
+function startSmartDocumentScan() {
+  const hint = document.getElementById('scan-hint');
+
+  if (!hasNativeDocumentScanner()) {
+    if (hint) hint.textContent = 'Escáner inteligente disponible solo en Android.';
+    alert('El escáner inteligente se abre desde el APK instalado en Android. En navegador, use Cargar PDF.');
+    return;
+  }
+
+  try {
+    if (state.cameraStream) {
+      stopLiveDocumentDetection();
+      state.cameraStream.getTracks().forEach(track => track.stop());
+      state.cameraStream = null;
+      state.cameraReady = false;
+    }
+
+    if (hint) hint.textContent = 'Abriendo escáner inteligente...';
+    const pageLimit = state.retakeIndex !== null ? 1 : 50;
+    const response = window.CiespalDocumentScanner.scanDocuments(pageLimit);
+    const parsed = parseNativeBridgeResult(response);
+
+    if (!parsed || !parsed.success) {
+      const message = parsed?.error || 'No se pudo abrir ML Kit.';
+      if (hint) hint.textContent = 'Intente Escanear otra vez o use Cargar PDF.';
+      alert(`No se pudo abrir el escáner inteligente:\n${message}`);
+    }
+  } catch (err) {
+    console.warn('Escáner inteligente no disponible:', err);
+    if (hint) hint.textContent = 'No se pudo abrir el escáner inteligente.';
+    alert(`No se pudo abrir el escáner inteligente:\n${err.message || err}`);
+  }
+}
+
+async function handleNativeDocumentScanResult(event) {
+  const detail = typeof event.detail === 'string'
+    ? parseNativeBridgeResult(event.detail)
+    : (event.detail || {});
+  const hint = document.getElementById('scan-hint');
+
+  if (detail.cancelled) {
+    if (hint) hint.textContent = 'Escaneo cancelado. Puede volver a intentarlo.';
+    return;
+  }
+
+  if (!detail.success) {
+    const message = detail.error || 'El escáner no devolvió resultado.';
+    if (hint) hint.textContent = 'Intente Escanear otra vez o use Cargar PDF.';
+    alert(`No se pudo usar el escáner inteligente:\n${message}`);
+    return;
+  }
+
+  const pages = Array.isArray(detail.pages) ? detail.pages : [];
+  if (!pages.length) {
+    if (hint) hint.textContent = 'El escáner no devolvió páginas.';
+    alert('ML Kit no devolvió páginas para guardar.');
+    return;
+  }
+
+  const targetIndex = state.retakeIndex !== null ? state.retakeIndex : null;
+  let imported = 0;
+
+  try {
+    showProcessingOverlay('Importando páginas escaneadas...', 8);
+    for (let i = 0; i < pages.length; i++) {
+      updateProcessingProgress(
+        `Guardando hoja ${i + 1} de ${pages.length}...`,
+        10 + Math.round(((i + 1) / pages.length) * 82)
+      );
+
+      const pageBase64 = getNativeScannedPageBase64(pages[i]);
+      if (!pageBase64) continue;
+
+      const replaceIndex = targetIndex !== null && imported === 0 ? targetIndex : null;
+      saveScannedPageBase64(pageBase64, replaceIndex, 'escaneada con ML Kit');
+      imported++;
+    }
+  } catch (err) {
+    console.error('Error importando escaneo ML Kit:', err);
+    alert(`No se pudieron importar las páginas escaneadas:\n${err.message || err}`);
+  } finally {
+    hideProcessingOverlay();
+  }
+
+  if (!imported) {
+    if (hint) hint.textContent = 'No se guardó ninguna hoja escaneada.';
+    return;
+  }
+
+  if (hint) {
+    hint.textContent = targetIndex !== null
+      ? `Hoja #${targetIndex + 1} reemplazada con escáner inteligente.`
+      : `${imported} hoja${imported === 1 ? '' : 's'} guardada${imported === 1 ? '' : 's'} con escáner inteligente.`;
+  }
+}
+
+function getNativeScannedPageBase64(page) {
+  const embedded = normalizeImageBase64(page?.imageBase64 || '');
+  if (embedded) return embedded;
+
+  if (
+    page?.uri &&
+    window.CiespalDocumentScanner &&
+    typeof window.CiespalDocumentScanner.readImageAsBase64 === 'function'
+  ) {
+    const response = window.CiespalDocumentScanner.readImageAsBase64(page.uri);
+    const parsed = parseNativeBridgeResult(response);
+    if (parsed?.success && parsed.imageBase64) {
+      return normalizeImageBase64(parsed.imageBase64);
+    }
+    throw new Error(parsed?.error || 'No se pudo leer la imagen escaneada.');
+  }
+
+  return '';
+}
+
+function normalizeImageBase64(value) {
+  return String(value || '')
+    .replace(/^data:image\/[a-z0-9.+-]+;base64,/i, '')
+    .trim();
+}
+
+function saveScannedPageBase64(base64, targetIndex = null, qualityLabel = 'guardada') {
+  const cleanBase64 = normalizeImageBase64(base64);
+  if (!cleanBase64) throw new Error('Imagen escaneada vacía.');
+
+  const blob = imageBase64ToBlob(cleanBase64);
+  const hint = document.getElementById('scan-hint');
+  const startsFreshLot = targetIndex === null && state.bookPagesBase64.length === 0;
+  if (startsFreshLot) clearRecordState();
+  state.savedPagesBase64 = [];
+
+  if (targetIndex !== null && targetIndex >= 0 && targetIndex < state.bookPagesBase64.length) {
+    state.bookPagesBuffer[targetIndex] = blob;
+    state.bookPagesBase64[targetIndex] = cleanBase64;
+    if (state.retakeIndex === targetIndex) state.retakeIndex = null;
+    if (hint) hint.textContent = `Hoja #${targetIndex + 1} reemplazada, ${qualityLabel}`;
+  } else {
+    state.bookPagesBuffer.push(blob);
+    state.bookPagesBase64.push(cleanBase64);
+    if (hint) hint.textContent = `Hoja #${state.bookPagesBuffer.length} guardada, ${qualityLabel}`;
+  }
+
+  updatePageCounter();
+  renderThumbnails();
+  if (startsFreshLot) renderKohaRecordsTable();
+  scheduleDraftSave();
 }
 
 // ========== CAPTURA DIRECTA CON RECORTE AUTOMÁTICO ESTILO ADOBE SCAN / OPENCV ==========
@@ -214,34 +1463,6 @@ function capturePagePhoto() {
   const tempCtx = tempCanvas.getContext('2d');
   tempCtx.drawImage(video, 0, 0, fullW, fullH);
 
-  // 2. Intentar recorte de 4 esquinas y transformación de perspectiva estilo Adobe Scan con OpenCV.js
-  let openCvSuccess = false;
-  try {
-    openCvSuccess = autoCropPerspectiveOpenCV(tempCanvas, canvas);
-  } catch (err) {
-    console.warn('Error OpenCV:', err);
-  }
-
-  // 3. Si OpenCV no detectó un cuadrilátero claro, usar recorte de gradiente inteligente
-  if (!openCvSuccess) {
-    const bounds = detectSmartBookBounds(tempCtx, fullW, fullH);
-    canvas.width = bounds.w;
-    canvas.height = bounds.h;
-    const ctx = canvas.getContext('2d');
-
-    ctx.filter = 'contrast(1.08) brightness(1.03)';
-    ctx.drawImage(tempCanvas, bounds.x, bounds.y, bounds.w, bounds.h, 0, 0, bounds.w, bounds.h);
-    ctx.filter = 'none';
-  }
-
-  // 4. Aplicar Filtro de Realce de Documento OpenCV (Fondo Blanco Limpio / B/N Nítido)
-  enhanceDocumentWithOpenCV(canvas, state.scanFilterMode || 'magic_color');
-
-  // Obtener DataURL y Blob recortado y realzado de la hoja
-  const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
-  const base64 = dataUrl.split(',')[1];
-  const blob = dataURLToBlob(dataUrl);
-
   // Efecto visual de flash blanco en la cámara al disparar
   const wrapper = document.querySelector('.viewfinder-wrapper');
   if (wrapper) {
@@ -249,23 +1470,38 @@ function capturePagePhoto() {
     setTimeout(() => { wrapper.style.opacity = '1'; }, 120);
   }
 
-  if (state.retakeIndex !== null) {
-    // Modo reemplazar hoja existente
-    const targetIdx = state.retakeIndex;
-    state.bookPagesBuffer[targetIdx] = blob;
-    state.bookPagesBase64[targetIdx] = base64;
-    state.retakeIndex = null;
-    document.getElementById('scan-hint').textContent = `Hoja #${targetIdx + 1} reemplazada y realzada`;
-  } else {
-    // Agregar nueva hoja al libro
-    state.bookPagesBuffer.push(blob);
-    state.bookPagesBase64.push(base64);
-    document.getElementById('scan-hint').textContent = `Hoja #${state.bookPagesBuffer.length} escaneada y realzada`;
+  const targetIndex = state.retakeIndex !== null ? state.retakeIndex : null;
+  let cropSuccess = false;
+  let captureQualityLabel = 'recortada';
+
+  if (cropFromLiveDetection(tempCanvas, canvas)) {
+    cropSuccess = true;
+    captureQualityLabel = 'bordes detectados y recortada';
   }
 
-  // Actualizar contador y renderizar carrusel de miniaturas inmediatamente
-  updatePageCounter();
-  renderThumbnails();
+  try {
+    if (!cropSuccess && SCAN_CONFIG.usePerspectiveWarp) {
+      cropSuccess = autoCropPerspectiveOpenCV(tempCanvas, canvas);
+      if (cropSuccess) captureQualityLabel = 'recortada y enderezada';
+    }
+  } catch (err) {
+    console.warn('Error OpenCV:', err);
+  }
+
+  if (!cropSuccess) {
+    const bounds = detectForegroundBookBounds2D(tempCtx, fullW, fullH)
+      || detectPaperSheetBounds2D(tempCtx, fullW, fullH)
+      || detectSmartBookBounds(tempCtx, fullW, fullH);
+    renderCroppedFrame(tempCanvas, canvas, bounds);
+    captureQualityLabel = bounds?.method === 'foreground'
+      ? 'libro detectado y recortado'
+      : bounds?.method === 'paper'
+        ? 'hoja detectada y recortada'
+        : 'recortada con ajuste automático';
+  }
+
+  enhanceDocumentWithOpenCV(canvas, state.scanFilterMode || 'magic_color');
+  saveProcessedPageCanvas(canvas, targetIndex, captureQualityLabel);
 }
 
 /**
@@ -310,19 +1546,22 @@ function enhanceDocumentWithOpenCV(canvas, mode = 'magic_color') {
     const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const d = imgData.data;
     for (let i = 0; i < d.length; i += 4) {
-      const lum = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
+      const r = d[i];
+      const g = d[i + 1];
+      const b = d[i + 2];
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
       if (mode === 'bw') {
         const val = lum > 135 ? 255 : 0;
         d[i] = val; d[i+1] = val; d[i+2] = val;
       } else {
         if (lum > 165) {
-          d[i] = Math.min(255, d[i] * 1.18);
-          d[i+1] = Math.min(255, d[i] * 1.18);
-          d[i+2] = Math.min(255, d[i] * 1.18);
+          d[i] = Math.min(255, r * 1.18);
+          d[i+1] = Math.min(255, g * 1.18);
+          d[i+2] = Math.min(255, b * 1.18);
         } else if (lum < 115) {
-          d[i] = Math.max(0, d[i] * 0.82);
-          d[i+1] = Math.max(0, d[i] * 0.82);
-          d[i+2] = Math.max(0, d[i] * 0.82);
+          d[i] = Math.max(0, r * 0.82);
+          d[i+1] = Math.max(0, g * 0.82);
+          d[i+2] = Math.max(0, b * 0.82);
         }
       }
     }
@@ -338,123 +1577,606 @@ function autoCropPerspectiveOpenCV(srcCanvas, dstCanvas) {
     return false;
   }
 
+  let src;
+  let srcTri;
+  let dstTri;
+  let transform;
+  let dst;
   try {
-    const src = cv.imread(srcCanvas);
-    const gray = new cv.Mat();
-    const blur = new cv.Mat();
-    const edges = new cv.Mat();
-    const contours = new cv.MatVector();
-    const hierarchy = new cv.Mat();
-
-    // 1. Convertir a grises y suavizar ruido
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
-
-    // 2. Detección de bordes Canny
-    cv.Canny(blur, edges, 75, 200);
-
-    // 3. Encontrar contornos
-    cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
-
-    let maxArea = 0;
-    let maxContourIndex = -1;
-    let bestPoly = null;
-    const imgArea = src.rows * src.cols;
-
-    // Buscar el contorno cuadrilátero de 4 esquinas más grande (área > 10% del total)
-    for (let i = 0; i < contours.size(); ++i) {
-      const cnt = contours.get(i);
-      const area = cv.contourArea(cnt);
-      if (area > imgArea * 0.10 && area > maxArea) {
-        const peri = cv.arcLength(cnt, true);
-        const approx = new cv.Mat();
-        cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
-
-        if (approx.rows === 4) {
-          maxArea = area;
-          maxContourIndex = i;
-          bestPoly = approx;
-        } else {
-          approx.delete();
-        }
-      }
+    src = cv.imread(srcCanvas);
+    const candidate = findDocumentPolygonOpenCV(src);
+    if (!candidate) {
+      return false;
     }
 
-    if (maxContourIndex >= 0 && bestPoly) {
-      const pts = [];
-      for (let i = 0; i < 4; i++) {
-        pts.push({
-          x: bestPoly.data32S[i * 2],
-          y: bestPoly.data32S[i * 2 + 1]
-        });
-      }
-      bestPoly.delete();
-
-      // Ordenar 4 puntos: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]
-      pts.sort((a, b) => a.y - b.y);
-      const topPts = [pts[0], pts[1]].sort((a, b) => a.x - b.x);
-      const botPts = [pts[2], pts[3]].sort((a, b) => a.x - b.x);
-
-      const tl = topPts[0];
-      const tr = topPts[1];
-      const br = botPts[1];
-      const bl = botPts[0];
-
-      // Dimensiones del rectángulo de salida
-      const widthA = Math.hypot(br.x - bl.x, br.y - bl.y);
-      const widthB = Math.hypot(tr.x - tl.x, tr.y - tl.y);
-      const maxWidth = Math.max(widthA, widthB);
-
-      const heightA = Math.hypot(tr.x - br.x, tr.y - br.y);
-      const heightB = Math.hypot(tl.x - bl.x, tl.y - bl.y);
-      const maxHeight = Math.max(heightA, heightB);
-
-      if (maxWidth < 100 || maxHeight < 100) {
-        src.delete(); gray.delete(); blur.delete(); edges.delete();
-        contours.delete(); hierarchy.delete();
-        return false;
-      }
-
-      const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
-        tl.x, tl.y,
-        tr.x, tr.y,
-        br.x, br.y,
-        bl.x, bl.y
-      ]);
-      const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
-        0, 0,
-        maxWidth - 1, 0,
-        maxWidth - 1, maxHeight - 1,
-        0, maxHeight - 1
-      ]);
-
-      // Transformación de perspectiva estilo Adobe Scan
-      const M = cv.getPerspectiveTransform(srcTri, dstTri);
-      const dst = new cv.Mat();
-      const dsize = new cv.Size(maxWidth, maxHeight);
-      cv.warpPerspective(src, dst, M, dsize);
-
-      // Renderizar resultado en canvas de salida
-      dstCanvas.width = maxWidth;
-      dstCanvas.height = maxHeight;
-      cv.imshow(dstCanvas, dst);
-
-      // Limpieza de memoria WebAssembly
-      src.delete(); gray.delete(); blur.delete(); edges.delete();
-      contours.delete(); hierarchy.delete(); srcTri.delete();
-      dstTri.delete(); M.delete(); dst.delete();
-
-      return true; // Éxito en recorte y enderezado estilo Adobe Scan
+    const ordered = orderDocumentPoints(candidate.points);
+    const size = getPerspectiveOutputSize(ordered);
+    if (!isPerspectiveSizeValid(size, src.cols, src.rows)) {
+      return false;
     }
 
-    src.delete(); gray.delete(); blur.delete(); edges.delete();
-    contours.delete(); hierarchy.delete();
-    return false;
+    const { tl, tr, br, bl } = ordered;
+    srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+      tl.x, tl.y,
+      tr.x, tr.y,
+      br.x, br.y,
+      bl.x, bl.y
+    ]);
+    dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+      0, 0,
+      size.width - 1, 0,
+      size.width - 1, size.height - 1,
+      0, size.height - 1
+    ]);
+
+    transform = cv.getPerspectiveTransform(srcTri, dstTri);
+    dst = new cv.Mat();
+    cv.warpPerspective(src, dst, transform, new cv.Size(size.width, size.height));
+
+    dstCanvas.width = size.width;
+    dstCanvas.height = size.height;
+    cv.imshow(dstCanvas, dst);
+    return true;
 
   } catch (err) {
     console.warn('Fallback OpenCV autoCrop:', err);
     return false;
+  } finally {
+    [src, srcTri, dstTri, transform, dst].forEach(mat => {
+      if (mat && typeof mat.delete === 'function') mat.delete();
+    });
   }
+}
+
+function findDocumentPolygonOpenCV(src) {
+  const mats = [];
+  let best = null;
+
+  try {
+    const gray = new cv.Mat();
+    const blur = new cv.Mat();
+    mats.push(gray, blur);
+
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+
+    const cannySoft = new cv.Mat();
+    const cannyStrong = new cv.Mat();
+    const adaptive = new cv.Mat();
+    const adaptiveEdges = new cv.Mat();
+    const otsu = new cv.Mat();
+    const kernel3 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+    const kernel7 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 7));
+    mats.push(cannySoft, cannyStrong, adaptive, adaptiveEdges, otsu, kernel3, kernel7);
+
+    cv.Canny(blur, cannySoft, 35, 120);
+    cv.dilate(cannySoft, cannySoft, kernel3);
+
+    cv.Canny(blur, cannyStrong, 70, 190);
+    cv.dilate(cannyStrong, cannyStrong, kernel3);
+
+    cv.adaptiveThreshold(blur, adaptive, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 31, 7);
+    cv.morphologyEx(adaptive, adaptive, cv.MORPH_CLOSE, kernel7);
+    cv.Canny(adaptive, adaptiveEdges, 40, 140);
+    cv.dilate(adaptiveEdges, adaptiveEdges, kernel3);
+
+    cv.threshold(blur, otsu, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+    cv.morphologyEx(otsu, otsu, cv.MORPH_CLOSE, kernel7);
+
+    [cannySoft, cannyStrong, adaptiveEdges, otsu].forEach((mask, idx) => {
+      const found = findBestPolygonInMask(mask, src.cols, src.rows, idx * 0.15);
+      if (found && (!best || found.score > best.score)) {
+        best = found;
+      }
+    });
+  } catch (err) {
+    console.warn('OpenCV polygon detection failed:', err);
+  } finally {
+    mats.forEach(mat => {
+      if (mat && typeof mat.delete === 'function') mat.delete();
+    });
+  }
+
+  return best;
+}
+
+function findBestPolygonInMask(mask, imgW, imgH, scoreBias = 0) {
+  const work = mask.clone();
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  let best = null;
+  const imgArea = imgW * imgH;
+
+  try {
+    cv.findContours(work, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+
+    for (let i = 0; i < contours.size(); i++) {
+      const contour = contours.get(i);
+      let hull = null;
+
+      try {
+        if (Math.abs(cv.contourArea(contour)) < imgArea * 0.025) continue;
+
+        const shape = new cv.Mat();
+        hull = shape;
+        if (typeof cv.convexHull === 'function') {
+          cv.convexHull(contour, shape, false, true);
+        } else {
+          contour.copyTo(shape);
+        }
+
+        const area = Math.abs(cv.contourArea(shape));
+        if (area < imgArea * 0.10 || area > imgArea * 0.985) continue;
+
+        const perimeter = cv.arcLength(shape, true);
+        const epsilons = [0.012, 0.018, 0.026, 0.036, 0.052, 0.07];
+
+        for (const epsilon of epsilons) {
+          const approx = new cv.Mat();
+          try {
+            cv.approxPolyDP(shape, approx, epsilon * perimeter, true);
+            if (approx.rows !== 4) continue;
+            if (typeof cv.isContourConvex === 'function' && !cv.isContourConvex(approx)) continue;
+
+            const points = matToPoints(approx);
+            const score = scoreDocumentPolygon(points, area, imgW, imgH) + scoreBias;
+            if (Number.isFinite(score) && (!best || score > best.score)) {
+              best = { points, score };
+            }
+          } finally {
+            approx.delete();
+          }
+        }
+      } finally {
+        if (hull) hull.delete();
+        contour.delete();
+      }
+    }
+  } finally {
+    work.delete();
+    contours.delete();
+    hierarchy.delete();
+  }
+
+  return best;
+}
+
+function matToPoints(mat) {
+  const points = [];
+  const data = mat.data32S || mat.data32F;
+  for (let i = 0; i < mat.rows; i++) {
+    points.push({
+      x: data[i * 2],
+      y: data[i * 2 + 1]
+    });
+  }
+  return points;
+}
+
+function orderDocumentPoints(points) {
+  if (!points || points.length !== 4) return null;
+
+  const bySum = [...points].sort((a, b) => (a.x + a.y) - (b.x + b.y));
+  const byDiff = [...points].sort((a, b) => (a.x - a.y) - (b.x - b.y));
+  const ordered = {
+    tl: bySum[0],
+    br: bySum[3],
+    tr: byDiff[3],
+    bl: byDiff[0]
+  };
+
+  const unique = new Set(Object.values(ordered).map(p => `${Math.round(p.x)}:${Math.round(p.y)}`));
+  if (unique.size === 4) return ordered;
+
+  const byY = [...points].sort((a, b) => a.y - b.y);
+  const top = [byY[0], byY[1]].sort((a, b) => a.x - b.x);
+  const bottom = [byY[2], byY[3]].sort((a, b) => a.x - b.x);
+  return { tl: top[0], tr: top[1], br: bottom[1], bl: bottom[0] };
+}
+
+function getPerspectiveOutputSize(ordered) {
+  const widthA = Math.hypot(ordered.br.x - ordered.bl.x, ordered.br.y - ordered.bl.y);
+  const widthB = Math.hypot(ordered.tr.x - ordered.tl.x, ordered.tr.y - ordered.tl.y);
+  const heightA = Math.hypot(ordered.tr.x - ordered.br.x, ordered.tr.y - ordered.br.y);
+  const heightB = Math.hypot(ordered.tl.x - ordered.bl.x, ordered.tl.y - ordered.bl.y);
+  return {
+    width: Math.max(1, Math.round(Math.max(widthA, widthB))),
+    height: Math.max(1, Math.round(Math.max(heightA, heightB)))
+  };
+}
+
+function isPerspectiveSizeValid(size, imgW, imgH) {
+  const minSide = Math.min(size.width, size.height);
+  const maxSide = Math.max(size.width, size.height);
+  if (minSide < Math.min(imgW, imgH) * 0.18) return false;
+  if (size.width * size.height < imgW * imgH * 0.10) return false;
+  return maxSide / minSide <= 3.2;
+}
+
+function scoreDocumentPolygon(points, area, imgW, imgH) {
+  const ordered = orderDocumentPoints(points);
+  if (!ordered) return Number.NEGATIVE_INFINITY;
+
+  const size = getPerspectiveOutputSize(ordered);
+  if (!isPerspectiveSizeValid(size, imgW, imgH)) return Number.NEGATIVE_INFINITY;
+
+  const areaRatio = Math.abs(polygonArea(points)) / (imgW * imgH);
+  if (areaRatio < 0.10 || areaRatio > 0.985) return Number.NEGATIVE_INFINITY;
+
+  const rectArea = size.width * size.height;
+  const fillRatio = Math.min(1, Math.max(0, area / Math.max(1, rectArea)));
+  const aspect = Math.max(size.width, size.height) / Math.max(1, Math.min(size.width, size.height));
+  const aspectPenalty = Math.max(0, aspect - 1.65) * 8;
+  const center = centroid(points);
+  const centerDistance = Math.hypot(center.x - imgW / 2, center.y - imgH / 2) / Math.hypot(imgW / 2, imgH / 2);
+  const anglePenalty = maxCornerCosine(ordered) * 12;
+
+  return areaRatio * 100 + fillRatio * 22 - aspectPenalty - centerDistance * 18 - anglePenalty;
+}
+
+function polygonArea(points) {
+  let area = 0;
+  for (let i = 0; i < points.length; i++) {
+    const current = points[i];
+    const next = points[(i + 1) % points.length];
+    area += current.x * next.y - next.x * current.y;
+  }
+  return Math.abs(area / 2);
+}
+
+function centroid(points) {
+  const sum = points.reduce((acc, point) => {
+    acc.x += point.x;
+    acc.y += point.y;
+    return acc;
+  }, { x: 0, y: 0 });
+  return { x: sum.x / points.length, y: sum.y / points.length };
+}
+
+function maxCornerCosine({ tl, tr, br, bl }) {
+  return Math.max(
+    Math.abs(cornerCosine(bl, tl, tr)),
+    Math.abs(cornerCosine(tl, tr, br)),
+    Math.abs(cornerCosine(tr, br, bl)),
+    Math.abs(cornerCosine(br, bl, tl))
+  );
+}
+
+function cornerCosine(prev, corner, next) {
+  const ax = prev.x - corner.x;
+  const ay = prev.y - corner.y;
+  const bx = next.x - corner.x;
+  const by = next.y - corner.y;
+  const dot = ax * bx + ay * by;
+  const norm = Math.hypot(ax, ay) * Math.hypot(bx, by);
+  return norm ? dot / norm : 1;
+}
+
+function renderCroppedFrame(srcCanvas, dstCanvas, bounds) {
+  const clamped = clampBounds(bounds, srcCanvas.width, srcCanvas.height);
+  dstCanvas.width = clamped.w;
+  dstCanvas.height = clamped.h;
+  const ctx = dstCanvas.getContext('2d');
+  ctx.filter = 'contrast(1.08) brightness(1.03)';
+  ctx.drawImage(srcCanvas, clamped.x, clamped.y, clamped.w, clamped.h, 0, 0, clamped.w, clamped.h);
+  ctx.filter = 'none';
+}
+
+function clampBounds(bounds, maxW, maxH) {
+  const fallback = {
+    x: Math.round(maxW * 0.06),
+    y: Math.round(maxH * 0.08),
+    w: Math.round(maxW * 0.88),
+    h: Math.round(maxH * 0.84)
+  };
+  const source = bounds || fallback;
+  const x = Math.max(0, Math.min(maxW - 1, Math.round(source.x)));
+  const y = Math.max(0, Math.min(maxH - 1, Math.round(source.y)));
+  const w = Math.max(80, Math.min(maxW - x, Math.round(source.w)));
+  const h = Math.max(80, Math.min(maxH - y, Math.round(source.h)));
+  return { x, y, w, h, method: source.method || 'fallback' };
+}
+
+function detectForegroundBookBounds2D(tempCtx, w, h) {
+  try {
+    const sw = 260;
+    const sh = Math.max(1, Math.round((h / w) * sw));
+    const scaled = document.createElement('canvas');
+    scaled.width = sw;
+    scaled.height = sh;
+    const sCtx = scaled.getContext('2d');
+    sCtx.drawImage(tempCtx.canvas, 0, 0, sw, sh);
+
+    const pixels = sCtx.getImageData(0, 0, sw, sh).data;
+    const bg = cornerBackgroundColor(pixels, sw, sh);
+    const mask = new Uint8Array(sw * sh);
+    const dynamicThreshold = bg.lum < 70 ? 26 : 38;
+
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < sw; x++) {
+        const idx = (y * sw + x) * 4;
+        const r = pixels[idx];
+        const g = pixels[idx + 1];
+        const b = pixels[idx + 2];
+        const lum = luminance(r, g, b);
+        const chroma = Math.max(r, g, b) - Math.min(r, g, b);
+        const dist = colorDistance({ r, g, b, lum }, bg);
+
+        if (dist > dynamicThreshold || Math.abs(lum - bg.lum) > 34 || chroma > bg.chroma + 28) {
+          mask[y * sw + x] = 1;
+        }
+      }
+    }
+
+    closeMask(mask, sw, sh, 2);
+    const component = largestPaperComponent(mask, sw, sh);
+    if (!component) return null;
+
+    const boxW = component.maxX - component.minX + 1;
+    const boxH = component.maxY - component.minY + 1;
+    const touchesTooMuchEdge = (
+      component.minX <= 1 &&
+      component.minY <= 1 &&
+      component.maxX >= sw - 2 &&
+      component.maxY >= sh - 2
+    );
+    if (touchesTooMuchEdge || boxW * boxH > sw * sh * 0.96) {
+      return null;
+    }
+
+    const padX = Math.max(5, Math.round(boxW * 0.08));
+    const padY = Math.max(5, Math.round(boxH * 0.08));
+    const left = Math.max(0, component.minX - padX);
+    const top = Math.max(0, component.minY - padY);
+    const right = Math.min(sw - 1, component.maxX + padX);
+    const bottom = Math.min(sh - 1, component.maxY + padY);
+    const scaleX = w / sw;
+    const scaleY = h / sh;
+
+    return {
+      x: Math.round(left * scaleX),
+      y: Math.round(top * scaleY),
+      w: Math.round((right - left + 1) * scaleX),
+      h: Math.round((bottom - top + 1) * scaleY),
+      method: 'foreground'
+    };
+  } catch (err) {
+    console.warn('Foreground bounds fallback failed:', err);
+    return null;
+  }
+}
+
+function detectPaperSheetBounds2D(tempCtx, w, h) {
+  try {
+    const sw = 240;
+    const sh = Math.max(1, Math.round((h / w) * sw));
+    const scaled = document.createElement('canvas');
+    scaled.width = sw;
+    scaled.height = sh;
+    const sCtx = scaled.getContext('2d');
+    sCtx.drawImage(tempCtx.canvas, 0, 0, sw, sh);
+
+    const pixels = sCtx.getImageData(0, 0, sw, sh).data;
+    const luminanceValues = [];
+    for (let i = 0; i < pixels.length; i += 4) {
+      luminanceValues.push(luminance(pixels[i], pixels[i + 1], pixels[i + 2]));
+    }
+    luminanceValues.sort((a, b) => a - b);
+
+    const p55 = percentile(luminanceValues, 0.55);
+    const p82 = percentile(luminanceValues, 0.82);
+    const bg = cornerBackgroundLuminance(pixels, sw, sh);
+    const threshold = clampNumber(Math.max(108, Math.min(p82 - 8, Math.max(p55 + 14, bg + 18))), 100, 228);
+    const mask = new Uint8Array(sw * sh);
+
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < sw; x++) {
+        const idx = (y * sw + x) * 4;
+        const r = pixels[idx];
+        const g = pixels[idx + 1];
+        const b = pixels[idx + 2];
+        const lum = luminance(r, g, b);
+        const chroma = Math.max(r, g, b) - Math.min(r, g, b);
+        if ((lum >= threshold && chroma < 92) || lum >= p82 + 6) {
+          mask[y * sw + x] = 1;
+        }
+      }
+    }
+
+    const component = largestPaperComponent(mask, sw, sh);
+    if (!component) return null;
+
+    const padX = Math.max(2, Math.round((component.maxX - component.minX) * 0.025));
+    const padY = Math.max(2, Math.round((component.maxY - component.minY) * 0.025));
+    const left = Math.max(0, component.minX - padX);
+    const top = Math.max(0, component.minY - padY);
+    const right = Math.min(sw - 1, component.maxX + padX);
+    const bottom = Math.min(sh - 1, component.maxY + padY);
+
+    const scaleX = w / sw;
+    const scaleY = h / sh;
+    return {
+      x: Math.round(left * scaleX),
+      y: Math.round(top * scaleY),
+      w: Math.round((right - left + 1) * scaleX),
+      h: Math.round((bottom - top + 1) * scaleY),
+      method: 'paper'
+    };
+  } catch (err) {
+    console.warn('Paper bounds fallback failed:', err);
+    return null;
+  }
+}
+
+function largestPaperComponent(mask, sw, sh) {
+  const visited = new Uint8Array(mask.length);
+  let best = null;
+  const minArea = sw * sh * 0.045;
+
+  for (let y = 1; y < sh - 1; y++) {
+    for (let x = 1; x < sw - 1; x++) {
+      const start = y * sw + x;
+      if (!mask[start] || visited[start]) continue;
+
+      const stack = [start];
+      visited[start] = 1;
+      let area = 0;
+      let minX = x;
+      let maxX = x;
+      let minY = y;
+      let maxY = y;
+
+      while (stack.length) {
+        const idx = stack.pop();
+        const cx = idx % sw;
+        const cy = Math.floor(idx / sw);
+        area++;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+
+        [[cx - 1, cy], [cx + 1, cy], [cx, cy - 1], [cx, cy + 1]].forEach(([nx, ny]) => {
+          if (nx < 0 || nx >= sw || ny < 0 || ny >= sh) return;
+          const next = ny * sw + nx;
+          if (visited[next] || !mask[next]) return;
+          visited[next] = 1;
+          stack.push(next);
+        });
+      }
+
+      const boxW = maxX - minX + 1;
+      const boxH = maxY - minY + 1;
+      if (area < minArea || boxW < sw * 0.24 || boxH < sh * 0.24) continue;
+
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+      const centerDistance = Math.hypot(centerX - sw / 2, centerY - sh / 2) / Math.hypot(sw / 2, sh / 2);
+      const fillRatio = area / (boxW * boxH);
+      const score = area * (0.75 + fillRatio) - centerDistance * sw * sh * 0.08;
+
+      if (!best || score > best.score) {
+        best = { minX, maxX, minY, maxY, area, score };
+      }
+    }
+  }
+
+  return best;
+}
+
+function percentile(sortedValues, ratio) {
+  if (!sortedValues.length) return 0;
+  const idx = Math.max(0, Math.min(sortedValues.length - 1, Math.round((sortedValues.length - 1) * ratio)));
+  return sortedValues[idx];
+}
+
+function cornerBackgroundLuminance(pixels, w, h) {
+  const samples = [];
+  const size = Math.max(3, Math.round(Math.min(w, h) * 0.10));
+  const corners = [
+    [0, 0],
+    [w - size, 0],
+    [0, h - size],
+    [w - size, h - size]
+  ];
+
+  corners.forEach(([startX, startY]) => {
+    for (let y = Math.max(0, startY); y < Math.min(h, startY + size); y += 2) {
+      for (let x = Math.max(0, startX); x < Math.min(w, startX + size); x += 2) {
+        const idx = (y * w + x) * 4;
+        samples.push(luminance(pixels[idx], pixels[idx + 1], pixels[idx + 2]));
+      }
+    }
+  });
+
+  samples.sort((a, b) => a - b);
+  return percentile(samples, 0.45);
+}
+
+function cornerBackgroundColor(pixels, w, h) {
+  const colors = [];
+  const size = Math.max(4, Math.round(Math.min(w, h) * 0.11));
+  const corners = [
+    [0, 0],
+    [w - size, 0],
+    [0, h - size],
+    [w - size, h - size]
+  ];
+
+  corners.forEach(([startX, startY]) => {
+    for (let y = Math.max(0, startY); y < Math.min(h, startY + size); y += 2) {
+      for (let x = Math.max(0, startX); x < Math.min(w, startX + size); x += 2) {
+        const idx = (y * w + x) * 4;
+        const r = pixels[idx];
+        const g = pixels[idx + 1];
+        const b = pixels[idx + 2];
+        colors.push({
+          r,
+          g,
+          b,
+          lum: luminance(r, g, b),
+          chroma: Math.max(r, g, b) - Math.min(r, g, b)
+        });
+      }
+    }
+  });
+
+  if (!colors.length) return { r: 0, g: 0, b: 0, lum: 0, chroma: 0 };
+  colors.sort((a, b) => a.lum - b.lum);
+  const sample = colors[Math.floor(colors.length * 0.45)];
+  return sample || colors[0];
+}
+
+function colorDistance(color, bg) {
+  return (
+    Math.abs(color.r - bg.r) * 0.35 +
+    Math.abs(color.g - bg.g) * 0.35 +
+    Math.abs(color.b - bg.b) * 0.35 +
+    Math.abs(color.lum - bg.lum) * 0.75
+  );
+}
+
+function closeMask(mask, w, h, passes = 1) {
+  for (let i = 0; i < passes; i++) {
+    dilateMask(mask, w, h);
+  }
+  for (let i = 0; i < passes; i++) {
+    erodeMask(mask, w, h);
+  }
+}
+
+function dilateMask(mask, w, h) {
+  const source = mask.slice();
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const idx = y * w + x;
+      if (source[idx]) continue;
+      if (source[idx - 1] || source[idx + 1] || source[idx - w] || source[idx + w]) {
+        mask[idx] = 1;
+      }
+    }
+  }
+}
+
+function erodeMask(mask, w, h) {
+  const source = mask.slice();
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const idx = y * w + x;
+      if (!source[idx]) continue;
+      if (!source[idx - 1] || !source[idx + 1] || !source[idx - w] || !source[idx + w]) {
+        mask[idx] = 0;
+      }
+    }
+  }
+}
+
+function luminance(r, g, b) {
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
 /**
@@ -759,6 +2481,7 @@ async function handlePDFUpload(e) {
     return;
   }
 
+  resetScanBuffer();
   showProcessingOverlay('Leyendo y convirtiendo páginas del archivo PDF...', 15);
 
   try {
@@ -806,6 +2529,7 @@ async function handlePDFUpload(e) {
 
     updatePageCounter();
     renderThumbnails();
+    scheduleDraftSave();
     hideProcessingOverlay();
 
     alert(`Se cargó el PDF con ${numPages} hojas.\n\nPresione 'Compilar y Generar PDF' para extraer los metadatos con IA.`);
@@ -828,6 +2552,7 @@ function renderThumbnails() {
 
   if (state.bookPagesBase64.length === 0) {
     bar.classList.add('hidden');
+    updateHomeOverview();
     return;
   }
 
@@ -835,28 +2560,30 @@ function renderThumbnails() {
 
   state.bookPagesBase64.forEach((b64, idx) => {
     const card = document.createElement('div');
-    card.className = 'thumb-card';
-    card.title = `Hoja #${idx + 1} (Clic para previsualizar / repetir)`;
+    card.className = `thumb-card${state.activeModalIndex === idx ? ' active' : ''}`;
+    card.title = `Ver hoja #${idx + 1}`;
     card.innerHTML = `
       <img src="data:image/jpeg;base64,${b64}" alt="Hoja ${idx + 1}">
       <span class="thumb-num">#${idx + 1}</span>
-      <button type="button" class="thumb-remove" onclick="event.stopPropagation(); quickDeletePage(${idx})" title="Eliminar hoja">✕</button>
     `;
     card.addEventListener('click', () => openPageModal(idx));
     container.appendChild(card);
   });
+  updateHomeOverview();
 }
 
 function quickDeletePage(idx) {
   if (confirm(`¿Eliminar la Hoja #${idx + 1}?`)) {
     state.bookPagesBuffer.splice(idx, 1);
     state.bookPagesBase64.splice(idx, 1);
+    if (state.savedPagesBase64.length) state.savedPagesBase64.splice(idx, 1);
     
     if (state.retakeIndex === idx) state.retakeIndex = null;
     else if (state.retakeIndex > idx) state.retakeIndex--;
 
     updatePageCounter();
     renderThumbnails();
+    scheduleDraftSave();
   }
 }
 
@@ -864,20 +2591,79 @@ function quickDeletePage(idx) {
 function openPageModal(idx) {
   state.activeModalIndex = idx;
   const modal = document.getElementById('page-modal');
-  document.getElementById('modal-page-title').textContent = `Hoja #${idx + 1} de ${state.bookPagesBuffer.length}`;
-  document.getElementById('modal-page-img').src = `data:image/jpeg;base64,${state.bookPagesBase64[idx]}`;
+  renderPageModal();
   modal.classList.remove('hidden');
+  renderThumbnails();
 }
 
 function closeModal() {
   document.getElementById('page-modal').classList.add('hidden');
   state.activeModalIndex = null;
+  renderThumbnails();
+}
+
+function renderPageModal() {
+  const total = state.bookPagesBase64.length;
+  if (!total) {
+    closeModal();
+    return;
+  }
+
+  state.activeModalIndex = clampNumber(state.activeModalIndex ?? 0, 0, total - 1);
+  const idx = state.activeModalIndex;
+  document.getElementById('modal-page-title').textContent = `Hoja ${idx + 1} de ${total}`;
+  document.getElementById('modal-page-img').src = `data:image/jpeg;base64,${state.bookPagesBase64[idx]}`;
+
+  const prevBtn = document.getElementById('btn-modal-prev-page');
+  const nextBtn = document.getElementById('btn-modal-next-page');
+  if (prevBtn) prevBtn.disabled = total <= 1;
+  if (nextBtn) nextBtn.disabled = total <= 1;
+
+  renderModalThumbnails();
+}
+
+function renderModalThumbnails() {
+  const strip = document.getElementById('modal-thumbnails-strip');
+  if (!strip) return;
+
+  strip.innerHTML = '';
+  state.bookPagesBase64.forEach((b64, idx) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `modal-thumb${idx === state.activeModalIndex ? ' active' : ''}`;
+    button.title = `Ver hoja ${idx + 1}`;
+    button.innerHTML = `
+      <img src="data:image/jpeg;base64,${b64}" alt="Hoja ${idx + 1}">
+      <span>${idx + 1}</span>
+    `;
+    button.addEventListener('click', () => {
+      state.activeModalIndex = idx;
+      renderPageModal();
+      renderThumbnails();
+    });
+    strip.appendChild(button);
+  });
+}
+
+function moveModalPage(delta) {
+  if (state.activeModalIndex === null || state.bookPagesBase64.length === 0) return;
+  const total = state.bookPagesBase64.length;
+  state.activeModalIndex = (state.activeModalIndex + delta + total) % total;
+  renderPageModal();
+  renderThumbnails();
 }
 
 function deleteCurrentModalPage() {
   if (state.activeModalIndex !== null) {
-    quickDeletePage(state.activeModalIndex);
-    closeModal();
+    const idx = state.activeModalIndex;
+    quickDeletePage(idx);
+    if (state.bookPagesBase64.length === 0) {
+      closeModal();
+    } else {
+      state.activeModalIndex = Math.min(idx, state.bookPagesBase64.length - 1);
+      renderPageModal();
+      renderThumbnails();
+    }
   }
 }
 
@@ -887,9 +2673,9 @@ function prepareRetakeFromModal() {
     closeModal();
     
     document.getElementById('scan-hint').textContent = 
-      `MODO REPETIR: Tome la nueva foto para reemplazar la Hoja #${state.retakeIndex + 1}`;
+      `MODO REPETIR: Escanee una hoja para reemplazar la Hoja #${state.retakeIndex + 1}`;
     
-    alert(`Listo. Presione el botón blanco de captura para reemplazar la Hoja #${state.retakeIndex + 1}.`);
+    alert(`Listo. Presione Escanear para reemplazar la Hoja #${state.retakeIndex + 1}.`);
   }
 }
 
@@ -898,14 +2684,61 @@ function updatePageCounter() {
   document.getElementById('scanned-page-count').textContent = count;
   const btn = document.getElementById('btn-finish-pdf');
   count > 0 ? btn.classList.remove('hidden') : btn.classList.add('hidden');
+  updateHomeOverview();
 }
 
-function resetScanBuffer() {
+function updateHomeOverview() {
+  const pages = state.bookPagesBase64.length;
+  const records = state.records.length ? 1 : 0;
+  const pending = records;
+  const pdfPages = getCompiledPdfPages().length;
+
+  const emptyPanel = document.getElementById('empty-lot-panel');
+  if (emptyPanel) emptyPanel.classList.toggle('hidden', pages > 0);
+
+  const pendingEl = document.getElementById('home-pending-count');
+  if (pendingEl) pendingEl.textContent = pending;
+
+  const recordEl = document.getElementById('home-record-count');
+  if (recordEl) recordEl.textContent = records;
+
+  const pdfEl = document.getElementById('home-pdf-status');
+  if (pdfEl) {
+    pdfEl.textContent = state.savedPagesBase64.length
+      ? 'Listo'
+      : pdfPages
+        ? 'Pendiente'
+        : 'Sin lote';
+  }
+
+  const aiStatus = document.getElementById('home-ai-status');
+  if (aiStatus) aiStatus.textContent = getDeepSeekApiKey() ? 'Lista' : 'Sin key';
+}
+
+function getCompiledPdfPages() {
+  if (Array.isArray(state.savedPagesBase64) && state.savedPagesBase64.length) {
+    return state.savedPagesBase64;
+  }
+  if (Array.isArray(state.bookPagesBase64) && state.bookPagesBase64.length) {
+    return state.bookPagesBase64;
+  }
+  return [];
+}
+
+function resetScanBuffer(options = {}) {
+  const preserveSavedPages = Boolean(options.preserveSavedPages);
+  const preserveRecord = Boolean(options.preserveRecord);
+
   state.bookPagesBuffer = [];
   state.bookPagesBase64 = [];
+  if (!preserveSavedPages) state.savedPagesBase64 = [];
+  state.detectedIndexPages = [];
   state.retakeIndex = null;
+  if (!preserveRecord) clearRecordState();
   updatePageCounter();
   renderThumbnails();
+  if (!preserveRecord) renderKohaRecordsTable();
+  scheduleDraftSave();
 }
 
 // ========== HELPER DE COMPRESIÓN DE IMÁGENES PARA PAYLOAD IA (MAX 800PX) ==========
@@ -953,80 +2786,144 @@ async function resizeBase64ForAi(base64Str, maxDim = 800) {
   ]);
 }
 
-// ========== PROCESAMIENTO CON GEMINI AI REAL ==========
-async function processBookWithGeminiAI() {
+// ========== PROCESAMIENTO CON DEEPSEEK DIRECTO DESDE EL APK ==========
+async function processBookWithDeepSeekAI() {
   if (state.bookPagesBuffer.length === 0) {
-    alert('Primero tome fotos o cargue un PDF del libro.');
+    alert('Primero escanee hojas o cargue un PDF del libro.');
     return;
   }
 
+  const apiKey = await ensureDeepSeekApiKey();
+  if (!apiKey) return;
+
   const totalPages = state.bookPagesBuffer.length;
-  showProcessingOverlay('Enviando portadas a Google Gemini AI...', 10);
+  showProcessingOverlay('Preparando hojas para DeepSeek...', 10);
 
   try {
-    // Enviar TODAS las páginas del libro a la IA para lectura completa
-    const totalBookPages = state.bookPagesBase64.length;
+    const selectedIndexes = selectPageIndexesForAi(totalPages);
+    const content = [{
+      type: 'text',
+      text: buildDeepSeekExtractionPrompt(totalPages, selectedIndexes)
+    }];
 
-    updateProcessingProgress(`Comprimiendo ${totalBookPages} páginas para IA...`, 15);
-
-    const imageParts = [];
-    for (let i = 0; i < totalBookPages; i++) {
-      try {
-        // Comprimir a 600px y calidad 0.5 para que quepan todas las páginas
-        const compressedB64 = await resizeBase64ForAi(state.bookPagesBase64[i], 600);
-        imageParts.push({
-          inline_data: {
-            mime_type: 'image/jpeg',
-            data: compressedB64
-          }
-        });
-      } catch (e) {
-        imageParts.push({
-          inline_data: {
-            mime_type: 'image/jpeg',
-            data: state.bookPagesBase64[i]
-          }
-        });
-      }
-      // Actualizar progreso cada 5 páginas
-      if (i % 5 === 0) {
-        updateProcessingProgress(`Comprimiendo página ${i + 1} de ${totalBookPages}...`, 15 + Math.round((i / totalBookPages) * 25));
-      }
+    for (let i = 0; i < selectedIndexes.length; i++) {
+      const pageIndex = selectedIndexes[i];
+      const resizedBase64 = await resizeBase64ForAi(state.bookPagesBase64[pageIndex], 1200);
+      content.push({
+        type: 'image_url',
+        image_url: {
+          url: `data:image/jpeg;base64,${resizedBase64}`,
+          detail: 'high'
+        }
+      });
+      updateProcessingProgress(
+        `Preparando imagen ${i + 1} de ${selectedIndexes.length} para IA...`,
+        15 + Math.round(((i + 1) / selectedIndexes.length) * 25)
+      );
     }
 
-    updateProcessingProgress(`Enviando ${imageParts.length} páginas completas a Gemini AI...`, 45);
+    updateProcessingProgress('DeepSeek está extrayendo metadatos MARC21...', 55);
 
-    const extractionPrompt = {
-      contents: [{
-        parts: [
-          ...imageParts,
+    const result = await deepSeekHttpRequest(DEEPSEEK_CONFIG.apiUrl, {
+      method: 'POST',
+      apiKey,
+      timeoutMs: 180000,
+      data: {
+        model: DEEPSEEK_CONFIG.visionModel,
+        messages: [
           {
-            text: `Eres un bibliotecario experto y catalogador MARC21. Se te proporcionan TODAS las ${totalPages} páginas escaneadas de un libro. Examínalas con máximo detalle.
+            role: 'system',
+            content: 'Eres un catalogador experto MARC21 para una mediateca. Responde solo JSON válido.'
+          },
+          {
+            role: 'user',
+            content
+          }
+        ],
+        temperature: 0,
+        max_tokens: 8192,
+        response_format: { type: 'json_object' },
+        thinking: { type: 'disabled' }
+      }
+    });
 
-REGLAS ESTRICTAS PARA TABLA DE CONTENIDOS / ÍNDICE (tabla_contenidos):
-1. BUSCA en TODAS las imágenes proporcionadas cualquier página titulada "ÍNDICE", "CONTENIDO", "TABLA DE CONTENIDOS", "SUMARIO", "INDEX", "TABLE OF CONTENTS".
-2. SI ENCUENTRAS una página de índice/contenido en el documento, TRANSCRÍBELA EXACTAMENTE tal como aparece en la imagen, LÍNEA POR LÍNEA, SIN MODIFICAR NADA, SIN INVENTAR NADA. Copia cada título de capítulo, sección, subsección y número de página exactamente como está escrito.
-3. SOLO SI NO EXISTE ninguna página de índice en todo el documento, ENTONCES genera un índice estructurado basándote en los títulos de capítulos y secciones que veas EN LAS PÁGINAS PROPORCIONADAS. NO inventes títulos ni secciones que no existan en el documento.
-4. NUNCA inventes contenido. Solo transcribe lo que ves o genera basándote estrictamente en lo visible.
+    if (!result.ok) {
+      throw new Error(`DeepSeek respondió ${result.status}: ${extractDeepSeekError(result.data || result.text)}`);
+    }
 
-REGLAS DE EXTRACCIÓN DE CAMPOS:
-- titulo: Título principal del documento (exacto como aparece en la portada)
-- autor_principal: Autor principal formato "Apellido, Nombre"
-- colaboradores: Coautores, editores, ilustradores (separados por | si hay varios)
-- lugar_publicacion: Ciudad y/o país de publicación
-- editorial: Nombre de la editorial
-- anio_publicacion: Año de publicación o copyright
-- descripcion_fisica: Descripción física ej. "${totalPages} pág. 27 cm"
-- notas_fisicas: Condición física o características del ejemplar
-- tipo_material: Tipo de material (por defecto "Texto")
-- temas: Descriptores o palabras clave del contenido (separados por |)
-- clasificacion: Código de clasificación si es visible
-- resumen: Resumen breve del contenido del documento
-- tabla_contenidos: Índice/Tabla de contenidos (TRANSCRITA EXACTA si existe, o generada si no existe)
+    const contentText = result.data?.choices?.[0]?.message?.content || '';
+    const extracted = extractJsonFromAiText(contentText);
+    if (!Object.keys(extracted).length) {
+      throw new Error('DeepSeek no devolvió JSON válido.');
+    }
 
-Responde SOLO con JSON válido, sin formato markdown, sin bloques de código.
+    updateProcessingProgress('Generando registro y PDF local...', 88);
+    const record = normalizeDeepSeekRecord(extracted, totalPages);
 
+    updateProcessingProgress('Extracción MARC21 finalizada.', 100);
+
+    state.savedPagesBase64 = [...state.bookPagesBase64];
+
+    setTimeout(() => {
+      hideProcessingOverlay();
+      resetScanBuffer({ preserveSavedPages: true, preserveRecord: true });
+      onBookScanCompleted(record, totalPages);
+    }, 400);
+
+  } catch (err) {
+    hideProcessingOverlay();
+    console.error('Error en procesamiento directo con DeepSeek:', err);
+
+    const errorMsg = getDeepSeekDirectErrorMessage(err);
+    alert(`Error al procesar con IA:\n${errorMsg}\n\nSe cargará una plantilla vacía para completar manualmente.`);
+
+    state.savedPagesBase64 = [...state.bookPagesBase64];
+    resetScanBuffer({ preserveSavedPages: true, preserveRecord: true });
+    onBookScanCompleted(createFallbackRecord(totalPages), totalPages);
+  }
+}
+
+function selectPageIndexesForAi(totalPages) {
+  const indexes = new Set();
+  const firstPages = Math.min(totalPages, 10);
+  for (let i = 0; i < firstPages; i++) indexes.add(i);
+
+  (state.detectedIndexPages || []).forEach(idx => {
+    if (idx >= 0 && idx < totalPages) indexes.add(idx);
+  });
+
+  if (totalPages > 10) indexes.add(totalPages - 1);
+
+  return [...indexes]
+    .sort((a, b) => a - b)
+    .slice(0, DEEPSEEK_CONFIG.maxDirectPages);
+}
+
+function buildDeepSeekExtractionPrompt(totalPages, selectedIndexes) {
+  const selectedPages = selectedIndexes.map(idx => idx + 1).join(', ');
+  return `
+Eres un bibliotecario experto en catalogación MARC21/Koha para la Mediateca CIESPAL.
+Se escanearon ${totalPages} hojas. Para extraer metadatos estás viendo estas hojas: ${selectedPages}.
+
+Extrae metadatos bibliográficos reales usando solo texto visible. Si un dato no aparece claramente, deja el campo vacío. No inventes ISBN, editorial, autores, año, capítulos, clasificación ni materias por contexto.
+
+Perfil Koha observado para CIESPAL:
+- Clasificación/signatura local: 084 $a.
+- Publicación: 260 $a, 260 $b, 260 $c.
+- Descripción física: separa extensión 300 $a, soporte/detalle 300 $b y dimensiones 300 $c.
+- Materias controladas: 650 $a solo si aparecen explícitas o son muy evidentes.
+- Descriptores libres: 653 $a para palabras clave sugeridas por IA.
+- Recurso digital: 856 $y debe decir "Recuperar PDF"; 856 $u será el PDF local generado por la app.
+- Tipo local Koha para libros: 942 $c = "BK".
+
+Reglas para tabla_contenidos:
+1. Busca páginas tituladas "ÍNDICE", "INDICE", "CONTENIDO", "TABLA DE CONTENIDOS", "SUMARIO", "INDEX" o "TABLE OF CONTENTS".
+2. Si existe índice, transcríbelo línea por línea.
+3. Si no existe índice visible, deja tabla_contenidos vacío.
+
+Devuelve SOLO JSON válido con esta forma:
 {
+  "codigo_control": "",
   "isbn": "",
   "titulo": "",
   "subtitulo": "",
@@ -1035,162 +2932,257 @@ Responde SOLO con JSON válido, sin formato markdown, sin bloques de código.
   "lugar_publicacion": "",
   "editorial": "",
   "anio_publicacion": "",
-  "descripcion_fisica": "${totalPages} pág. 27 cm",
+  "numero_paginas": "",
+  "descripcion_fisica": "",
+  "soporte_fisico": "",
+  "dimensiones": "",
   "notas_fisicas": "",
-  "tipo_material": "Texto",
-  "temas": "",
+  "tipo_material": "BK",
+  "temas_controlados": "",
+  "descriptores_libres": "",
   "clasificacion": "",
   "resumen": "",
   "tabla_contenidos": ""
-}`
-          }
-        ]
-      }],
-      generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 16384
-      }
+}`.trim();
+}
+
+async function deepSeekHttpRequest(url, { method = 'GET', apiKey, data, timeoutMs = 180000 } = {}) {
+  const headers = {
+    Authorization: `Bearer ${apiKey}`
+  };
+  if (data !== undefined) headers['Content-Type'] = 'application/json';
+
+  const nativeHttp = window.Capacitor?.Plugins?.CapacitorHttp || window.CapacitorHttp;
+  const isNative = Boolean(window.Capacitor?.isNativePlatform?.());
+
+  if (isNative && nativeHttp?.request) {
+    const response = await nativeHttp.request({
+      url,
+      method,
+      headers,
+      data,
+      responseType: 'json',
+      connectTimeout: timeoutMs,
+      readTimeout: timeoutMs
+    });
+    return {
+      ok: response.status >= 200 && response.status < 300,
+      status: response.status,
+      data: parseHttpResponseData(response.data),
+      text: typeof response.data === 'string' ? response.data : JSON.stringify(response.data || '')
     };
-
-    updateProcessingProgress('Gemini AI estructurando registro MARC21...', 65);
-
-    const apiKeys = getApiKeys();
-    if (!apiKeys || apiKeys.length === 0) {
-      throw new Error('No se ha configurado ninguna Clave API de Google Gemini. Por favor configure su clave en el ícono de llave (🔑) del encabezado.');
-    }
-    let response = null;
-    let lastError = '';
-
-    // Buche de rotación automática: prueba cada clave API si la anterior agota su cuota
-    for (let kAttempt = 0; kAttempt < apiKeys.length; kAttempt++) {
-      const activeIdx = (state.currentKeyIndex + kAttempt) % apiKeys.length;
-      const currentKey = apiKeys[activeIdx];
-
-      for (const model of GEMINI_MODELS) {
-        try {
-          const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-          const res = await fetch(`${apiUrl}?key=${currentKey}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(extractionPrompt)
-          });
-
-          if (res.ok) {
-            response = res;
-            state.currentKeyIndex = activeIdx; // Guardar clave activa exitosa
-            break;
-          } else {
-            const errData = await res.json().catch(() => ({}));
-            lastError = errData?.error?.message || `Error ${res.status}`;
-            if (res.status === 429 || res.status === 403) {
-              const nextNum = ((activeIdx + 1) % apiKeys.length) + 1;
-              updateProcessingProgress(`Clave #${activeIdx + 1} en límite. Rotando automáticamente a Clave #${nextNum}...`, 75);
-            }
-          }
-        } catch (err) {
-          lastError = err.message;
-        }
-      }
-
-      if (response) break;
-    }
-
-    if (!response) {
-      console.warn('Gemini API no disponible en ninguna clave:', lastError);
-      throw new Error(`Conexión Gemini: ${lastError}`);
-    }
-
-    let extracted = {};
-    if (response) {
-      const data = await response.json().catch(() => ({}));
-      let aiText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      
-      // Limpiar bloques de código markdown que Gemini a veces envuelve (```json ... ```)
-      aiText = aiText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
-      
-      // Intentar extraer bloque JSON con regex
-      const jsonMatch = aiText.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        try {
-          extracted = JSON.parse(jsonMatch[0]);
-        } catch (e) {
-          console.warn('No se pudo parsear el JSON de la IA, usando campos por defecto:', aiText);
-        }
-      }
-    }
-
-    updateProcessingProgress('Generando archivo PDF del libro digitalizado...', 90);
-
-    const bookTitle = (extracted.titulo || extracted.titulo_principal || '').trim() || 'Documento_Digitalizado_CIESPAL';
-    const sanitizedName = bookTitle.replace(/[\\/*?:"<>|]/g, '').replace(/\s+/g, '_');
-    
-    const record = {
-      id: 'ciespal_' + Date.now().toString(36),
-      isbn: extracted.isbn || '',
-      titulo_principal: bookTitle,
-      subtitulo: extracted.subtitulo || '',
-      autor_principal: extracted.autor_principal || '',
-      colaboradores: extracted.colaboradores || extracted.autores_secundarios || '',
-      lugar_publicacion: extracted.lugar_publicacion || '',
-      editorial: extracted.editorial || '',
-      anio_publicacion: extracted.anio_publicacion || '',
-      descripcion_fisica: extracted.descripcion_fisica || `${totalPages} pág. 27 cm`,
-      notas_fisicas: extracted.notas_fisicas || '',
-      tipo_material: extracted.tipo_material || 'Texto',
-      temas: extracted.temas || extracted.palabras_clave || '',
-      clasificacion: extracted.clasificacion || '',
-      resumen: extracted.resumen || '',
-      tabla_contenidos: extracted.tabla_contenidos || '',
-      url_recurso_en_linea: `${sanitizedName}.pdf`,
-      enlace_documento: `${sanitizedName}.pdf`
-    };
-
-    updateProcessingProgress('¡Extracción MARC21 finalizada!', 100);
-
-    // IMPORTANTE: Guardar las hojas ANTES de resetear el buffer
-    state.savedPagesBase64 = [...state.bookPagesBase64];
-
-    setTimeout(() => {
-      hideProcessingOverlay();
-      resetScanBuffer();
-      onBookScanCompleted(record, totalPages);
-    }, 400);
-
-  } catch (err) {
-    hideProcessingOverlay();
-    console.error('Error en procesamiento con IA:', err);
-    
-    // Mostrar el error real al usuario en vez de fallar silenciosamente
-    const errorMsg = err.message || 'Error desconocido';
-    alert(`⚠️ Error al procesar con IA:\n${errorMsg}\n\nSe cargará una plantilla vacía para completar manualmente.`);
-    
-    // Guardar hojas antes de resetear
-    state.savedPagesBase64 = [...state.bookPagesBase64];
-
-    const fallbackRecord = {
-      id: 'ciespal_' + Date.now().toString(36),
-      isbn: '',
-      titulo_principal: 'Documento_Digitalizado_CIESPAL',
-      subtitulo: '',
-      autor_principal: '',
-      colaboradores: '',
-      lugar_publicacion: '',
-      editorial: '',
-      anio_publicacion: '',
-      descripcion_fisica: `${totalPages} pág. 27 cm`,
-      notas_fisicas: '',
-      tipo_material: 'Texto',
-      temas: '',
-      clasificacion: '',
-      resumen: '',
-      tabla_contenidos: '',
-      url_recurso_en_linea: 'Documento_Digitalizado_CIESPAL.pdf',
-      enlace_documento: 'Documento_Digitalizado_CIESPAL.pdf'
-    };
-
-    resetScanBuffer();
-    onBookScanCompleted(fallbackRecord, totalPages);
   }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method,
+      headers,
+      body: data === undefined ? undefined : JSON.stringify(data),
+      signal: controller.signal,
+      cache: 'no-store'
+    });
+    const text = await response.text();
+    return {
+      ok: response.ok,
+      status: response.status,
+      data: parseHttpResponseData(text),
+      text
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseHttpResponseData(data) {
+  if (!data) return {};
+  if (typeof data === 'object') return data;
+  try {
+    return JSON.parse(data);
+  } catch (err) {
+    return {};
+  }
+}
+
+function extractJsonFromAiText(text) {
+  const cleaned = String(text || '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '');
+
+  try {
+    const parsed = JSON.parse(cleaned);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (err) {
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (!match) return {};
+    try {
+      const parsed = JSON.parse(match[0]);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (innerErr) {
+      return {};
+    }
+  }
+}
+
+function extractDeepSeekError(payload) {
+  if (!payload) return 'error desconocido';
+  if (typeof payload === 'string') return payload.substring(0, 300);
+  return (payload.error?.message || payload.message || JSON.stringify(payload)).substring(0, 300);
+}
+
+function getDeepSeekDirectErrorMessage(err) {
+  const rawMessage = err?.message || 'Error desconocido';
+  if (/401|unauthorized|authentication|api key|invalid/i.test(rawMessage)) {
+    return 'La key de DeepSeek no parece válida. Toque el icono de llave y vuelva a pegarla.';
+  }
+  if (/failed to fetch|networkerror|load failed|network request failed|abort/i.test(rawMessage)) {
+    return 'No se pudo conectar con DeepSeek. Revise que el celular tenga internet. En navegador web puede fallar por CORS; en el APK usa HTTP nativo.';
+  }
+  return rawMessage;
+}
+
+function normalizeDeepSeekRecord(extracted, totalPages) {
+  const title = pickAiText(extracted, 'titulo', 'titulo_principal') || 'Documento Digitalizado CIESPAL';
+  const filename = sanitizeFilename(title) + '.pdf';
+  return normalizeBackendRecord({
+    id: 'ciespal_' + Date.now().toString(36),
+    codigo_control: pickAiText(extracted, 'codigo_control') || pickAiText(extracted, 'clasificacion'),
+    isbn: pickAiText(extracted, 'isbn'),
+    titulo_principal: title,
+    subtitulo: pickAiText(extracted, 'subtitulo'),
+    autor_principal: pickAiText(extracted, 'autor_principal', 'autor'),
+    colaboradores: pickAiText(extracted, 'colaboradores', 'autores_secundarios'),
+    autores_secundarios: pickAiText(extracted, 'colaboradores', 'autores_secundarios'),
+    lugar_publicacion: pickAiText(extracted, 'lugar_publicacion'),
+    editorial: pickAiText(extracted, 'editorial'),
+    anio_publicacion: pickAiText(extracted, 'anio_publicacion', 'anio'),
+    numero_paginas: pickAiText(extracted, 'numero_paginas'),
+    descripcion_fisica: pickAiText(extracted, 'descripcion_fisica'),
+    soporte_fisico: pickAiText(extracted, 'soporte_fisico'),
+    dimensiones: pickAiText(extracted, 'dimensiones'),
+    notas_fisicas: pickAiText(extracted, 'notas_fisicas'),
+    tipo_material: pickAiText(extracted, 'tipo_material') || CIESPAL_KOHA_PROFILE.itemType,
+    temas: pickAiText(extracted, 'temas_controlados', 'temas'),
+    temas_controlados: pickAiText(extracted, 'temas_controlados', 'temas'),
+    palabras_clave: pickAiText(extracted, 'descriptores_libres', 'palabras_clave'),
+    descriptores_libres: pickAiText(extracted, 'descriptores_libres', 'palabras_clave'),
+    clasificacion: pickAiText(extracted, 'clasificacion'),
+    resumen: pickAiText(extracted, 'resumen'),
+    tabla_contenidos: pickAiText(extracted, 'tabla_contenidos'),
+    url_recurso_en_linea: filename,
+    enlace_documento: filename
+  }, totalPages);
+}
+
+function pickAiText(data, ...keys) {
+  for (const key of keys) {
+    const value = aiValueToText(data?.[key]);
+    if (value) return value;
+  }
+  return '';
+}
+
+function aiValueToText(value) {
+  if (value === null || value === undefined) return '';
+  if (Array.isArray(value)) return value.map(aiValueToText).filter(Boolean).join(' | ');
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value).trim();
+}
+
+function normalizeBackendRecord(record, totalPages) {
+  const title = (record.titulo_principal || record.titulo || '').trim() || 'Documento Digitalizado CIESPAL';
+  const filename = sanitizeFilename(title) + '.pdf';
+  const physical = inferPhysicalParts(record, totalPages);
+  const temasControlados = record.temas_controlados || record.temas || '';
+  const descriptoresLibres = record.descriptores_libres || record.palabras_clave || '';
+  return {
+    ...record,
+    id: record.id || 'ciespal_' + Date.now().toString(36),
+    codigo_control: record.codigo_control || record.clasificacion || '',
+    titulo_principal: title,
+    autor_principal: record.autor_principal || '',
+    colaboradores: record.colaboradores || record.autores_secundarios || '',
+    autores_secundarios: record.autores_secundarios || record.colaboradores || '',
+    descripcion_fisica: record.descripcion_fisica || physical.extent,
+    numero_paginas: record.numero_paginas || physical.extent,
+    soporte_fisico: record.soporte_fisico || physical.support,
+    dimensiones: record.dimensiones || physical.dimensions,
+    tipo_material: normalizeKohaItemType(record.tipo_material),
+    temas: temasControlados,
+    temas_controlados: temasControlados,
+    palabras_clave: descriptoresLibres,
+    descriptores_libres: descriptoresLibres,
+    url_recurso_en_linea: record.url_recurso_en_linea || record.enlace_documento || filename,
+    enlace_documento: record.enlace_documento || record.url_recurso_en_linea || filename
+  };
+}
+
+function inferPhysicalParts(record = {}, totalPages = 0) {
+  const description = String(record.descripcion_fisica || record.numero_paginas || '').trim();
+  const fallbackExtent = totalPages ? `${totalPages} p.` : '';
+  const extent = String(record.numero_paginas || extractPhysicalExtent(description) || description || fallbackExtent).trim();
+  const dimensions = String(record.dimensiones || extractPhysicalDimensions(description)).trim();
+  const support = String(record.soporte_fisico || extractPhysicalSupport(description, extent, dimensions)).trim();
+  return { extent, support, dimensions };
+}
+
+function extractPhysicalExtent(value) {
+  const match = String(value || '').match(/\b\d+\s*(?:p\.|p[aá]g\.?|p[aá]gs\.?|p[aá]ginas|pages?)\b/i);
+  return match ? match[0].trim() : '';
+}
+
+function extractPhysicalDimensions(value) {
+  const match = String(value || '').match(/\b\d+(?:[.,]\d+)?\s*cm\b/i);
+  return match ? match[0].trim() : '';
+}
+
+function extractPhysicalSupport(value, extent, dimensions) {
+  let support = String(value || '');
+  [extent, dimensions].filter(Boolean).forEach(part => {
+    support = support.replace(part, '');
+  });
+  return support.replace(/\s+/g, ' ').replace(/^[\s.;,-]+|[\s.;,-]+$/g, '').trim();
+}
+
+function normalizeKohaItemType(value) {
+  const text = String(value || '').trim();
+  if (!text || ['texto', 'text', 'libro', 'book'].includes(text.toLowerCase())) {
+    return CIESPAL_KOHA_PROFILE.itemType;
+  }
+  return text;
+}
+
+function createFallbackRecord(totalPages) {
+  return {
+    id: 'ciespal_' + Date.now().toString(36),
+    codigo_control: '',
+    isbn: '',
+    titulo_principal: 'Documento Digitalizado CIESPAL',
+    subtitulo: '',
+    autor_principal: '',
+    colaboradores: '',
+    autores_secundarios: '',
+    lugar_publicacion: '',
+    editorial: '',
+    anio_publicacion: '',
+    descripcion_fisica: `${totalPages} p.`,
+    numero_paginas: `${totalPages} p.`,
+    soporte_fisico: '',
+    dimensiones: '',
+    notas_fisicas: '',
+    tipo_material: CIESPAL_KOHA_PROFILE.itemType,
+    temas: '',
+    temas_controlados: '',
+    palabras_clave: '',
+    descriptores_libres: '',
+    clasificacion: '',
+    resumen: '',
+    tabla_contenidos: '',
+    url_recurso_en_linea: 'Documento_Digitalizado_CIESPAL.pdf',
+    enlace_documento: 'Documento_Digitalizado_CIESPAL.pdf'
+  };
 }
 
 // ========== OVERLAY ==========
@@ -1210,9 +3202,7 @@ function hideProcessingOverlay() {
 }
 
 // ========== RESULTADO DE ESCANEO ==========
-function onBookScanCompleted(record, totalPages) {
-  state.currentRecord = record;
-
+function populateRecordForm(record, totalPages) {
   document.getElementById('record-id-badge').textContent = `ID: ${record.id}`;
   document.getElementById('field-titulo').value = record.titulo_principal || '';
   document.getElementById('field-subtitulo').value = record.subtitulo || '';
@@ -1221,13 +3211,16 @@ function onBookScanCompleted(record, totalPages) {
   document.getElementById('field-editorial').value = record.editorial || '';
   document.getElementById('field-lugar').value = record.lugar_publicacion || '';
   document.getElementById('field-anio').value = record.anio_publicacion || '';
-  document.getElementById('field-paginas').value = record.descripcion_fisica || record.numero_paginas || `${totalPages} pág. 27 cm`;
+  document.getElementById('field-paginas').value = record.numero_paginas || record.descripcion_fisica || `${totalPages} p.`;
+  document.getElementById('field-soporte-fisico').value = record.soporte_fisico || '';
+  document.getElementById('field-dimensiones').value = record.dimensiones || '';
   document.getElementById('field-pdf-url').value = record.url_recurso_en_linea || record.enlace_documento || '';
   document.getElementById('field-notas-fisicas').value = record.notas_fisicas || '';
-  document.getElementById('field-tipo-material').value = record.tipo_material || 'Texto';
+  document.getElementById('field-tipo-material').value = normalizeKohaItemType(record.tipo_material);
   document.getElementById('field-clasificacion').value = record.clasificacion || '';
   document.getElementById('field-autores-sec').value = record.colaboradores || record.autores_secundarios || '';
-  document.getElementById('field-palabras-clave').value = record.temas || record.palabras_clave || '';
+  document.getElementById('field-temas-controlados').value = record.temas_controlados || record.temas || '';
+  document.getElementById('field-palabras-clave').value = record.descriptores_libres || record.palabras_clave || '';
   document.getElementById('field-resumen').value = record.resumen || '';
   document.getElementById('field-tabla-contenidos').value = record.tabla_contenidos || '';
 
@@ -1242,6 +3235,51 @@ function onBookScanCompleted(record, totalPages) {
   document.getElementById('btn-open-pdf').onclick = () => {
     downloadCompiledPDF(sanitizedPdfName);
   };
+}
+
+function collectRecordFromForm(baseRecord = {}) {
+  const newTitle = document.getElementById('field-titulo')?.value || '';
+  const sanitizedPdfName = sanitizeFilename(newTitle || 'Documento_Digitalizado') + '.pdf';
+  const clasificacion = document.getElementById('field-clasificacion')?.value || '';
+  const temasControlados = document.getElementById('field-temas-controlados')?.value || '';
+  const descriptoresLibres = document.getElementById('field-palabras-clave')?.value || '';
+
+  return {
+    ...baseRecord,
+    id: baseRecord.id || 'ciespal_' + Date.now().toString(36),
+    codigo_control: clasificacion || baseRecord.codigo_control || '',
+    titulo_principal: newTitle,
+    subtitulo: document.getElementById('field-subtitulo')?.value || '',
+    autor_principal: document.getElementById('field-autor')?.value || '',
+    isbn: document.getElementById('field-isbn')?.value || '',
+    editorial: document.getElementById('field-editorial')?.value || '',
+    lugar_publicacion: document.getElementById('field-lugar')?.value || '',
+    anio_publicacion: document.getElementById('field-anio')?.value || '',
+    descripcion_fisica: document.getElementById('field-paginas')?.value || '',
+    numero_paginas: document.getElementById('field-paginas')?.value || '',
+    soporte_fisico: document.getElementById('field-soporte-fisico')?.value || '',
+    dimensiones: document.getElementById('field-dimensiones')?.value || '',
+    url_recurso_en_linea: sanitizedPdfName,
+    enlace_documento: sanitizedPdfName,
+    notas_fisicas: document.getElementById('field-notas-fisicas')?.value || '',
+    tipo_material: normalizeKohaItemType(document.getElementById('field-tipo-material')?.value || 'BK'),
+    clasificacion,
+    colaboradores: document.getElementById('field-autores-sec')?.value || '',
+    autores_secundarios: document.getElementById('field-autores-sec')?.value || '',
+    temas: temasControlados,
+    temas_controlados: temasControlados,
+    palabras_clave: descriptoresLibres,
+    descriptores_libres: descriptoresLibres,
+    resumen: document.getElementById('field-resumen')?.value || '',
+    tabla_contenidos: document.getElementById('field-tabla-contenidos')?.value || ''
+  };
+}
+
+function onBookScanCompleted(record, totalPages) {
+  setActiveRecord(record);
+  populateRecordForm(record, totalPages);
+  updateHomeOverview();
+  scheduleDraftSave();
 
   document.querySelector('[data-target="screen-review"]').click();
 }
@@ -1249,8 +3287,14 @@ function onBookScanCompleted(record, totalPages) {
 // ========== NOTIFICACIÓN NATIVA DE DESCARGA EN LA BARRA SUPERIOR DE ANDROID ==========
 function triggerAndroidSystemDownload(base64Data, filename, mimeType) {
   if (window.AndroidDownloadManager && window.AndroidDownloadManager.downloadFile) {
-    window.AndroidDownloadManager.downloadFile(base64Data, filename, mimeType);
-    return true;
+    try {
+      const result = window.AndroidDownloadManager.downloadFile(base64Data, filename, mimeType);
+      const parsed = parseNativeDownloadResult(result);
+      if (!parsed || parsed.success) return true;
+      console.warn('AndroidDownloadManager falló:', parsed.error);
+    } catch (err) {
+      console.warn('AndroidDownloadManager no disponible:', err);
+    }
   }
 
   if (window.Capacitor?.Plugins?.Filesystem) {
@@ -1272,6 +3316,21 @@ function triggerAndroidSystemDownload(base64Data, filename, mimeType) {
     console.error('Fallback error:', err);
   }
   return false;
+}
+
+function parseNativeDownloadResult(result) {
+  return parseNativeBridgeResult(result);
+}
+
+function parseNativeBridgeResult(result) {
+  if (!result) return null;
+  if (typeof result === 'object') return result;
+  if (typeof result !== 'string') return null;
+  try {
+    return JSON.parse(result);
+  } catch (err) {
+    return null;
+  }
 }
 
 // ========== FUNCIÓN DE ALMACENAMIENTO FALLBACK ==========
@@ -1304,7 +3363,7 @@ async function saveAndShareFileNative(base64Data, filename, mimeType) {
 
 // ========== DESCARGA CON NOTIFICACIÓN NATIVA EN BARRA DE ANDROID ==========
 async function downloadCompiledPDF(filename) {
-  const pages = state.savedPagesBase64 || state.bookPagesBase64;
+  const pages = getCompiledPdfPages();
   if (!pages || pages.length === 0) {
     alert('No hay hojas para generar el PDF.');
     return;
@@ -1363,38 +3422,13 @@ function showPDFViewerModal(dataUri, pagesBase64, filename) {
 async function handleFormSubmit(e) {
   e.preventDefault();
 
-  const newTitle = document.getElementById('field-titulo').value;
-  const sanitizedPdfName = newTitle.replace(/[\\/*?:"<>|]/g, '').replace(/\s+/g, '_') + '.pdf';
+  const updatedRecord = collectRecordFromForm(state.currentRecord || {});
+  const sanitizedPdfName = updatedRecord.enlace_documento || 'Documento_Digitalizado.pdf';
 
-  const updatedRecord = {
-    ...state.currentRecord,
-    titulo_principal: newTitle,
-    subtitulo: document.getElementById('field-subtitulo').value,
-    autor_principal: document.getElementById('field-autor').value,
-    isbn: document.getElementById('field-isbn').value,
-    editorial: document.getElementById('field-editorial').value,
-    lugar_publicacion: document.getElementById('field-lugar').value,
-    anio_publicacion: document.getElementById('field-anio').value,
-    descripcion_fisica: document.getElementById('field-paginas').value,
-    numero_paginas: document.getElementById('field-paginas').value,
-    url_recurso_en_linea: sanitizedPdfName,
-    enlace_documento: sanitizedPdfName,
-    notas_fisicas: document.getElementById('field-notas-fisicas').value,
-    tipo_material: document.getElementById('field-tipo-material').value,
-    clasificacion: document.getElementById('field-clasificacion').value,
-    colaboradores: document.getElementById('field-autores-sec').value,
-    autores_secundarios: document.getElementById('field-autores-sec').value,
-    temas: document.getElementById('field-palabras-clave').value,
-    palabras_clave: document.getElementById('field-palabras-clave').value,
-    resumen: document.getElementById('field-resumen').value,
-    tabla_contenidos: document.getElementById('field-tabla-contenidos').value
-  };
-
-  const idx = state.records.findIndex(r => r.id === updatedRecord.id);
-  if (idx >= 0) state.records[idx] = updatedRecord;
-  else state.records.push(updatedRecord);
+  setActiveRecord(updatedRecord);
 
   renderKohaRecordsTable();
+  scheduleDraftSave();
 
   // Guardar y descargar PDF con notificación en la barra de Android
   await downloadCompiledPDF(sanitizedPdfName);
@@ -1405,131 +3439,445 @@ async function handleFormSubmit(e) {
 function renderKohaRecordsTable() {
   const tbody = document.getElementById('koha-records-body');
   tbody.innerHTML = '';
-  document.getElementById('pending-count').textContent = state.records.length;
+  document.getElementById('pending-count').textContent = state.records.length ? 1 : 0;
+  updateHomeOverview();
+  renderRecordsStrip();
 
   if (state.records.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px;">
+    tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--text-muted);padding:20px;">
       No hay libros catalogados en este lote. Escanee un libro o cargue un PDF.</td></tr>`;
     return;
   }
 
+  const selected = getActiveExportRecord();
+  if (!selected) return;
+
+  const tr = document.createElement('tr');
+  appendEditableRecordCell(tr, selected, '020a ISBN', 'isbn', { size: 'medium' });
+  appendEditableRecordCell(tr, selected, '245a Título', 'titulo_principal', { size: 'large' });
+  appendEditableRecordCell(tr, selected, '100a Autor', 'autor_principal', { size: 'large' });
+  appendEditableRecordCell(tr, selected, '260c Año', 'anio_publicacion', { size: 'small' });
+  appendEditableRecordCell(tr, selected, '300a Págs', 'numero_paginas', { size: 'small' });
+  appendEditableRecordCell(tr, selected, '084a Clasif.', 'clasificacion', { size: 'small' });
+  appendEditableRecordCell(tr, selected, '650a Materias', 'temas_controlados', { multiline: true, size: 'large' });
+  appendEditableRecordCell(tr, selected, '653a Descriptores', 'descriptores_libres', { multiline: true, size: 'large' });
+  appendEditableRecordCell(tr, selected, '856u PDF', 'enlace_documento', { size: 'large' });
+
+  const actionTd = document.createElement('td');
+  actionTd.dataset.label = 'Acción';
+  const editBtn = document.createElement('button');
+  editBtn.type = 'button';
+  editBtn.className = 'btn-secondary table-action-btn';
+  editBtn.textContent = 'Formulario';
+  editBtn.addEventListener('click', () => window.editRecord(selected.id));
+  actionTd.appendChild(editBtn);
+  tr.appendChild(actionTd);
+  tbody.appendChild(tr);
+}
+
+function renderRecordsStrip() {
+  const strip = document.getElementById('records-strip');
+  if (!strip) return;
+
+  strip.innerHTML = '';
+  if (!state.records.length) {
+    strip.classList.add('hidden');
+    return;
+  }
+
+  if (!state.activeRecordId || !state.records.some(rec => rec.id === state.activeRecordId)) {
+    state.activeRecordId = state.records[0].id;
+  }
+
+  strip.classList.remove('hidden');
   state.records.forEach((rec, idx) => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td><code>${rec.isbn || '-'}</code></td>
-      <td><strong>${rec.titulo_principal}</strong></td>
-      <td>${rec.autor_principal}</td>
-      <td>${rec.numero_paginas || '-'}</td>
-      <td><code style="font-size:0.6rem;">${rec.enlace_documento}</code></td>
-      <td style="display:flex;gap:4px;flex-direction:column;">
-        <button class="btn-secondary" style="padding:4px 8px;font-size:0.68rem;" onclick="editRecord('${rec.id}')">Editar</button>
-        <button class="btn-primary" style="padding:4px 8px;font-size:0.68rem;" onclick="downloadSingleCSV('${rec.id}', ${idx})">CSV</button>
-      </td>
-    `;
-    tbody.appendChild(tr);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `record-chip${rec.id === state.activeRecordId ? ' active' : ''}`;
+    button.title = rec.titulo_principal || `Libro ${idx + 1}`;
+
+    const title = document.createElement('span');
+    title.className = 'record-chip-title';
+    title.textContent = rec.titulo_principal || `Libro ${idx + 1}`;
+
+    const meta = document.createElement('span');
+    meta.className = 'record-chip-meta';
+    meta.textContent = rec.autor_principal || rec.enlace_documento || 'Sin autor';
+
+    button.appendChild(title);
+    button.appendChild(meta);
+    button.addEventListener('click', () => {
+      state.activeRecordId = rec.id;
+      renderKohaRecordsTable();
+      scheduleDraftSave();
+    });
+    strip.appendChild(button);
   });
+}
+
+function getActiveExportRecord() {
+  if (!state.records.length) return null;
+  let rec = state.records.find(r => r.id === state.activeRecordId);
+  if (!rec) {
+    rec = state.records[0];
+    state.activeRecordId = rec.id;
+  }
+  return rec;
+}
+
+function appendEditableRecordCell(row, record, label, field, options = {}) {
+  const td = document.createElement('td');
+  td.dataset.label = label;
+  const el = document.createElement(options.multiline ? 'textarea' : 'input');
+  if (!options.multiline) el.type = 'text';
+  el.className = [
+    options.multiline ? 'koha-edit-textarea' : 'koha-edit-input',
+    options.size ? `koha-edit-${options.size}` : ''
+  ].filter(Boolean).join(' ');
+  el.value = getRecordGridValue(record, field);
+  el.addEventListener('input', () => updateRecordFieldFromGrid(record.id, field, el.value));
+  td.appendChild(el);
+  row.appendChild(td);
+}
+
+function getRecordGridValue(record, field) {
+  if (field === 'temas_controlados') return record.temas_controlados || record.temas || '';
+  if (field === 'descriptores_libres') return record.descriptores_libres || record.palabras_clave || '';
+  if (field === 'enlace_documento') return record.enlace_documento || record.url_recurso_en_linea || '';
+  return record[field] || '';
+}
+
+function updateRecordFieldFromGrid(id, field, value) {
+  const rec = state.records.find(r => r.id === id);
+  if (!rec) return;
+
+  rec[field] = value;
+  if (field === 'numero_paginas') rec.descripcion_fisica = value;
+  if (field === 'clasificacion') rec.codigo_control = value || rec.codigo_control || '';
+  if (field === 'temas_controlados') rec.temas = value;
+  if (field === 'descriptores_libres') rec.palabras_clave = value;
+  if (field === 'enlace_documento') rec.url_recurso_en_linea = value;
+
+  if (state.currentRecord?.id === id) {
+    state.currentRecord = { ...state.currentRecord, ...rec };
+    syncVisibleFormField(field, value);
+  }
+
+  if (field === 'titulo_principal' || field === 'autor_principal' || field === 'enlace_documento') {
+    renderRecordsStrip();
+  }
+
+  scheduleDraftSave();
+}
+
+function syncVisibleFormField(field, value) {
+  const idsByField = {
+    isbn: 'field-isbn',
+    titulo_principal: 'field-titulo',
+    autor_principal: 'field-autor',
+    anio_publicacion: 'field-anio',
+    numero_paginas: 'field-paginas',
+    clasificacion: 'field-clasificacion',
+    temas_controlados: 'field-temas-controlados',
+    descriptores_libres: 'field-palabras-clave',
+    enlace_documento: 'field-pdf-url'
+  };
+  const input = document.getElementById(idsByField[field]);
+  if (input) input.value = value;
 }
 
 window.editRecord = function(id) {
   const rec = state.records.find(r => r.id === id);
-  if (rec) onBookScanCompleted(rec, parseInt(rec.numero_paginas) || 0);
+  if (rec) {
+    state.activeRecordId = rec.id;
+    onBookScanCompleted(rec, parseInt(rec.numero_paginas) || 0);
+  }
 };
 
-window.downloadSingleCSV = async function(id, index = 0) {
-  const rec = state.records.find(r => r.id === id);
-  if (!rec) return;
-  await generateAndDownloadCSV(rec, index);
-};
+// ========== EXPORTACIÓN KOHA MARC21 ==========
+const KOHA_CSV_HEADERS = [
+  '001',
+  '003',
+  '020$a',
+  '040$c',
+  '084$a',
+  '100$a',
+  '245$a',
+  '245$b',
+  '700$a',
+  '260$a',
+  '260$b',
+  '260$c',
+  '300$a',
+  '300$b',
+  '300$c',
+  '500$a',
+  '505$a',
+  '520$a',
+  '650$a',
+  '653$a',
+  '856$y',
+  '856$u',
+  '942$2',
+  '942$c',
+  '952$a',
+  '952$b',
+  '952$y',
+  '952$o',
+  '952$u'
+];
 
-// ========== EXPORTACIÓN Y DESCARGA CSV KOHA MARC21 ==========
 async function downloadKohaCSV() {
   if (state.records.length === 0) {
     alert('No hay registros para exportar.');
     return;
   }
 
-  // Descargar cada registro como un CSV independiente
-  for (let recIdx = 0; recIdx < state.records.length; recIdx++) {
-    await generateAndDownloadCSV(state.records[recIdx], recIdx);
-    // Pequeña pausa entre descargas múltiples
-    if (state.records.length > 1 && recIdx < state.records.length - 1) {
-      await new Promise(r => setTimeout(r, 800));
-    }
-  }
+  const sep = ',';
+  let csv = '\uFEFF' + KOHA_CSV_HEADERS.map(h => `"${h}"`).join(sep) + '\n';
+
+  state.records.forEach(rec => {
+    csv += buildKohaExportRow(rec).map(escCsv).join(sep) + '\n';
+  });
+
+  downloadTextFile(csv, `${getExportBaseName()}.csv`, 'text/csv');
 }
 
-async function generateAndDownloadCSV(rec, index = 0) {
-  const sep = ';';
-  let csv = '\uFEFF';
-
-  // Encabezado del libro
-  csv += escCsv('FICHA BIBLIOGRÁFICA MARC21') + sep + escCsv(rec.titulo_principal || 'Documento Digitalizado') + '\n';
-  csv += sep + '\n';
-
-  // Sección: Identificación de la Obra
-  csv += escCsv('IDENTIFICACIÓN DE LA OBRA') + sep + '\n';
-  csv += escCsv('020a — ISBN') + sep + escCsv(rec.isbn) + '\n';
-  csv += escCsv('245a — Título') + sep + escCsv(rec.titulo_principal) + '\n';
-  csv += escCsv('245b — Subtítulo') + sep + escCsv(rec.subtitulo) + '\n';
-  csv += escCsv('100a — Autor Principal') + sep + escCsv(rec.autor_principal) + '\n';
-  csv += escCsv('700a — Colaboradores') + sep + escCsv(rec.colaboradores || rec.autores_secundarios) + '\n';
-  csv += sep + '\n';
-
-  // Sección: Publicación y Descripción Física
-  csv += escCsv('PUBLICACIÓN Y DESCRIPCIÓN FÍSICA') + sep + '\n';
-  csv += escCsv('264a — Lugar de Publicación') + sep + escCsv(rec.lugar_publicacion) + '\n';
-  csv += escCsv('264b — Editorial') + sep + escCsv(rec.editorial) + '\n';
-  csv += escCsv('264c — Año de Publicación') + sep + escCsv(rec.anio_publicacion) + '\n';
-  csv += escCsv('300a — Descripción Física') + sep + escCsv(rec.descripcion_fisica || rec.numero_paginas) + '\n';
-  csv += escCsv('500a — Notas Físicas') + sep + escCsv(rec.notas_fisicas) + '\n';
-  csv += escCsv('Naturaleza — Tipo de Material') + sep + escCsv(rec.tipo_material || 'Texto') + '\n';
-  csv += sep + '\n';
-
-  // Sección: Indexación y Clasificación
-  csv += escCsv('INDEXACIÓN Y CLASIFICACIÓN') + sep + '\n';
-  csv += escCsv('650a — Temas') + sep + escCsv(rec.temas || rec.palabras_clave) + '\n';
-  csv += escCsv('090a — Clasificación') + sep + escCsv(rec.clasificacion) + '\n';
-  csv += escCsv('520a — Resumen') + sep + escCsv(rec.resumen) + '\n';
-  csv += sep + '\n';
-
-  // Sección: Tabla de Contenidos
-  csv += escCsv('TABLA DE CONTENIDOS') + sep + '\n';
-  const tocText = rec.tabla_contenidos || '';
-  const tocEntries = tocText.split(/[\n\r|]+/).map(l => l.trim()).filter(l => l.length > 0);
-  if (tocEntries.length > 0) {
-    csv += escCsv('505a — Índice') + sep + escCsv(tocEntries[0]) + '\n';
-    for (let i = 1; i < tocEntries.length; i++) {
-      csv += escCsv('') + sep + escCsv(tocEntries[i]) + '\n';
-    }
-  } else {
-    csv += escCsv('505a — Índice') + sep + escCsv('') + '\n';
+async function downloadKohaExcel() {
+  if (state.records.length === 0) {
+    alert('No hay registros para exportar.');
+    return;
   }
-  csv += sep + '\n';
 
-  // Sección: Recurso Digital
-  csv += escCsv('RECURSO DIGITAL KOHA') + sep + '\n';
-  csv += escCsv('856u — Enlace al Documento') + sep + escCsv(rec.url_recurso_en_linea || rec.enlace_documento) + '\n';
+  const html = buildKohaExcelWorkbook(state.records);
+  downloadTextFile(html, `${getExportBaseName()}.xls`, 'application/vnd.ms-excel');
+}
 
-  const rawTitle = rec.titulo_principal || `Documento_CIESPAL_${index+1}`;
-  const cleanTitle = rawTitle
-    .trim()
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .replace(/[\\/*?:"<>|]/g, '')
-    .replace(/\s+/g, '_')
-    .substring(0, 70);
+function buildKohaExportRow(rec) {
+  const physical = physicalMarcParts(rec);
+  const resourceUrl = rec.url_recurso_en_linea || rec.enlace_documento || '';
+  const itemType = normalizeKohaItemType(rec.tipo_material);
+  return [
+    rec.id,
+    buildControl003(rec),
+    rec.isbn,
+    'CIESPAL.',
+    rec.clasificacion,
+    rec.autor_principal,
+    rec.titulo_principal,
+    rec.subtitulo,
+    joinMarcValues(rec.colaboradores || rec.autores_secundarios),
+    rec.lugar_publicacion,
+    rec.editorial,
+    rec.anio_publicacion,
+    physical.extent,
+    physical.support,
+    physical.dimensions,
+    rec.notas_fisicas,
+    rec.tabla_contenidos,
+    rec.resumen,
+    joinMarcValues(rec.temas_controlados || rec.temas, true),
+    joinMarcValues(rec.descriptores_libres || rec.palabras_clave, true),
+    resourceUrl ? CIESPAL_KOHA_PROFILE.resourceLabel : '',
+    resourceUrl,
+    CIESPAL_KOHA_PROFILE.classificationSource,
+    itemType,
+    CIESPAL_KOHA_PROFILE.branchId,
+    CIESPAL_KOHA_PROFILE.branchId,
+    itemType,
+    rec.clasificacion,
+    resourceUrl
+  ];
+}
 
-  // Generamos un timestamp corto o usamos el indice para garantizar que nunca se sobreescriba
-  const ts = new Date().getTime().toString().slice(-4);
-  const filename = `${cleanTitle}_${ts}.csv`;
+function buildKohaExcelWorkbook(records) {
+  const rows = records.map(buildKohaExportRow);
+  const headerHtml = KOHA_CSV_HEADERS
+    .map(header => `<th>${xmlEscape(header)}</th>`)
+    .join('');
+  const bodyHtml = rows.map(row => `
+    <tr>${row.map(value => `<td>${xmlEscape(value)}</td>`).join('')}</tr>
+  `).join('');
 
-  const utf8Bytes = new TextEncoder().encode(csv);
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: Arial, sans-serif; }
+    table { border-collapse: collapse; width: 100%; }
+    th { background: #1d6295; color: #ffffff; font-weight: 700; }
+    th, td { border: 1px solid #b8c7d4; padding: 8px; vertical-align: top; mso-number-format:"\\@"; }
+    td { white-space: pre-wrap; }
+    tr:nth-child(even) td { background: #f3f7fb; }
+  </style>
+</head>
+<body>
+  <table>
+    <thead><tr>${headerHtml}</tr></thead>
+    <tbody>${bodyHtml}</tbody>
+  </table>
+</body>
+</html>`;
+}
+
+async function downloadKohaMARCXML() {
+  if (state.records.length === 0) {
+    alert('No hay registros para exportar.');
+    return;
+  }
+
+  const xml = buildMARCXMLCollection(state.records);
+  downloadTextFile(xml, `${getExportBaseName()}.xml`, 'application/marcxml+xml');
+}
+
+function buildMARCXMLCollection(records) {
+  const recordsXml = records.map(buildMARCXMLRecord).join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<collection xmlns="http://www.loc.gov/MARC21/slim">\n${recordsXml}\n</collection>\n`;
+}
+
+function buildMARCXMLRecord(rec) {
+  const id = xmlEscape(rec.id || 'ciespal_' + Date.now().toString(36));
+  const year = extractYear(rec.anio_publicacion);
+  const control008 = buildControl008(year);
+  const resourceUrl = rec.url_recurso_en_linea || rec.enlace_documento || '';
+  const itemType = normalizeKohaItemType(rec.tipo_material);
+
+  const fields = [
+    '  <record>',
+    '    <leader>00000nam a2200000 i 4500</leader>',
+    `    <controlfield tag="001">${id}</controlfield>`,
+    `    <controlfield tag="003">${xmlEscape(buildControl003(rec))}</controlfield>`,
+    `    <controlfield tag="005">${buildControl005()}</controlfield>`,
+    `    <controlfield tag="008">${xmlEscape(control008)}</controlfield>`,
+    datafieldXml('020', [['a', rec.isbn]]),
+    datafieldXml('040', [['c', 'CIESPAL.']]),
+    datafieldXml('084', [['a', rec.clasificacion]]),
+    datafieldXml('100', [['a', rec.autor_principal]], '1', ' '),
+    datafieldXml('245', [['a', rec.titulo_principal], ['b', rec.subtitulo]], '1', '0'),
+    datafieldXml('260', [['a', rec.lugar_publicacion], ['b', rec.editorial], ['c', rec.anio_publicacion]]),
+    datafieldXml('300', physicalMarcSubfields(rec)),
+    datafieldXml('500', [['a', rec.notas_fisicas]]),
+    ...splitContentLines(rec.tabla_contenidos).map(line => datafieldXml('505', [['a', line]], '0', ' ')),
+    datafieldXml('520', [['a', rec.resumen]]),
+    ...splitMarcValues(rec.temas_controlados || rec.temas, true).map(subject => datafieldXml('650', [['a', subject]], ' ', '4')),
+    ...splitMarcValues(rec.descriptores_libres || rec.palabras_clave, true).map(subject => datafieldXml('653', [['a', subject]])),
+    ...splitMarcValues(rec.colaboradores || rec.autores_secundarios).map(person => datafieldXml('700', [['a', person]], '1', ' ')),
+    datafieldXml('856', [['y', resourceUrl ? CIESPAL_KOHA_PROFILE.resourceLabel : ''], ['u', resourceUrl]], '4', '0'),
+    datafieldXml('942', [['2', CIESPAL_KOHA_PROFILE.classificationSource], ['c', itemType]]),
+    CIESPAL_KOHA_PROFILE.includeItemFields
+      ? datafieldXml('952', [
+          ['a', CIESPAL_KOHA_PROFILE.branchId],
+          ['b', CIESPAL_KOHA_PROFILE.branchId],
+          ['y', itemType],
+          ['o', rec.clasificacion],
+          ['u', resourceUrl]
+        ])
+      : '',
+    '  </record>'
+  ];
+
+  return fields.filter(Boolean).join('\n');
+}
+
+function datafieldXml(tag, subfields, ind1 = ' ', ind2 = ' ') {
+  const cleanSubfields = subfields
+    .map(([code, value]) => [code, value === null || value === undefined ? '' : String(value).trim()])
+    .filter(([, value]) => value.length > 0);
+  if (cleanSubfields.length === 0) return '';
+
+  const body = cleanSubfields
+    .map(([code, value]) => `      <subfield code="${xmlEscape(code)}">${xmlEscape(value)}</subfield>`)
+    .join('\n');
+  return `    <datafield tag="${xmlEscape(tag)}" ind1="${xmlEscape(ind1)}" ind2="${xmlEscape(ind2)}">\n${body}\n    </datafield>`;
+}
+
+function buildControl005() {
+  const now = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return [
+    now.getUTCFullYear(),
+    pad(now.getUTCMonth() + 1),
+    pad(now.getUTCDate()),
+    pad(now.getUTCHours()),
+    pad(now.getUTCMinutes()),
+    pad(now.getUTCSeconds())
+  ].join('') + '.0';
+}
+
+function buildControl008(year) {
+  const now = new Date();
+  const entered = String(now.getUTCFullYear()).slice(-2) +
+    String(now.getUTCMonth() + 1).padStart(2, '0') +
+    String(now.getUTCDate()).padStart(2, '0');
+  return `${entered}b${year || '    '}    ec ||||| |||| 00| 0 spa d`;
+}
+
+function buildControl003(rec) {
+  return String(rec.codigo_control || rec.clasificacion || 'CIESPAL').trim();
+}
+
+function physicalMarcParts(rec) {
+  const parts = inferPhysicalParts(rec, 0);
+  return {
+    extent: parts.extent || rec.numero_paginas || rec.descripcion_fisica || '',
+    support: parts.support || rec.soporte_fisico || '',
+    dimensions: parts.dimensions || rec.dimensiones || ''
+  };
+}
+
+function physicalMarcSubfields(rec) {
+  const physical = physicalMarcParts(rec);
+  return [
+    ['a', physical.extent],
+    ['b', physical.support],
+    ['c', physical.dimensions]
+  ];
+}
+
+function splitContentLines(value) {
+  if (!value) return [];
+  return String(value)
+    .split(/\r?\n|\s*\|\s*/)
+    .map(v => v.trim().replace(/^\.+|\.+$/g, ''))
+    .filter(Boolean);
+}
+
+function extractYear(value) {
+  const match = String(value || '').match(/\b(1[5-9]\d{2}|20\d{2})\b/);
+  return match ? match[1] : '';
+}
+
+function splitMarcValues(value, splitCommas = false) {
+  if (!value) return [];
+  const pattern = splitCommas ? /\s*[|;,]\s*/ : /\s*[|;]\s*/;
+  return String(value).split(pattern).map(v => v.trim()).filter(Boolean);
+}
+
+function joinMarcValues(value, splitCommas = false) {
+  return splitMarcValues(value, splitCommas).join(' | ');
+}
+
+function getExportBaseName() {
+  if (state.records.length === 1) {
+    return sanitizeFilename(state.records[0].titulo_principal || 'Documento_CIESPAL');
+  }
+  if (state.currentRecord?.titulo_principal) {
+    return sanitizeFilename(state.currentRecord.titulo_principal);
+  }
+  if (state.records.length > 1) {
+    return sanitizeFilename(`${state.records[0].titulo_principal || 'Lote'}_y_${state.records.length - 1}_libros`);
+  }
+  return 'Catalogo_CIESPAL';
+}
+
+function downloadTextFile(content, filename, mimeType) {
+  const utf8Bytes = new TextEncoder().encode(content);
   let binary = '';
   for (let i = 0; i < utf8Bytes.byteLength; i++) {
     binary += String.fromCharCode(utf8Bytes[i]);
   }
-  const base64Data = btoa(binary);
-
-  triggerAndroidSystemDownload(base64Data, filename, 'text/csv');
+  triggerAndroidSystemDownload(btoa(binary), filename, mimeType);
 }
 
 /**
@@ -1538,13 +3886,19 @@ async function generateAndDownloadCSV(rec, index = 0) {
  */
 function escCsv(str) {
   if (str === null || str === undefined || str === '') return '""';
-  // Normalizar saltos de línea, reemplazarlos por ' | ' para mantener todo compacto en una sola línea de Excel, y escapar comillas dobles (") como ("")
   const cleanStr = String(str)
     .trim()
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
-    .replace(/\n+/g, ' | ')
-    .replace(/\s{2,}/g, ' ')
     .replace(/"/g, '""');
   return `"${cleanStr}"`;
+}
+
+function xmlEscape(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 }

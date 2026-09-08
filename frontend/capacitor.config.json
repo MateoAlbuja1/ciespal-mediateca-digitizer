@@ -3,8 +3,8 @@
   "appName": "CIESPAL",
   "webDir": "dist",
   "plugins": {
-    "Camera": {
-      "permissions": ["camera", "photos"]
+    "CapacitorHttp": {
+      "enabled": true
     }
   },
   "server": {

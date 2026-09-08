@@ -37,7 +37,8 @@ def read_root():
         "endpoints": {
             "scan": "/api/v1/scan",
             "records": "/api/v1/records",
-            "export_csv": "/api/v1/export/csv"
+            "export_csv": "/api/v1/export/csv",
+            "export_marcxml": "/api/v1/export/marcxml"
         }
     }
 

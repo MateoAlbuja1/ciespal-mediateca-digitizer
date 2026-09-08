@@ -16,6 +16,7 @@ router = APIRouter(prefix="/api/v1")
 db_records: List[MARC21Record] = [
     MARC21Record(
         id="c1a2b3",
+        codigo_control="CIESPAL",
         isbn="978-9978-55-214-8",
         titulo_principal="Medios Masivos y Sociedad en América Latina",
         subtitulo="Transformaciones y Desafíos de la Comunicación Popular",
@@ -25,7 +26,10 @@ db_records: List[MARC21Record] = [
         editorial="CIESPAL Editorial",
         anio_publicacion="2023",
         numero_paginas="342 p.",
-        palabras_clave="Comunicación, Medios, Ecuador, CIESPAL, Periodismo",
+        soporte_fisico="Libro digitalizado",
+        dimensiones="27 cm",
+        tipo_material="BK",
+        descriptores_libres="Comunicación, Medios, Ecuador, CIESPAL, Periodismo",
         resumen="Estudio crítico sobre las políticas de comunicación en la región andina y la digitalización del archivo histórico.",
         enlace_documento="http://localhost:8000/uploads/pdfs/Medios_Masivos_y_Sociedad_en_América_Latina.pdf",
         fecha_creacion="2026-08-01 10:15:00"
@@ -53,16 +57,21 @@ async def scan_multipage_document(files: List[UploadFile] = File(...)):
         contents = await f.read()
         image_bytes_list.append(contents)
 
-    # 1. Ejecutar OCR sobre la portada (primera imagen)
+    # 1. Ejecutar OCR sobre la portada como respaldo y texto de diagnóstico
     portada_bytes = image_bytes_list[0]
     ocr_text = ocr_service.extract_text(portada_bytes)
 
-    # 2. Generar metadatos MARC21 con IA
-    record = ai_service.parse_marc21_metadata(ocr_text)
+    # 2. Generar metadatos MARC21 con DeepSeek Vision desde las páginas recibidas
+    record = ai_service.parse_marc21_metadata(
+        raw_text=ocr_text,
+        image_bytes_list=image_bytes_list
+    )
     
     # Actualizar número de páginas con el recuento real si se escanearon múltiples fotos
-    if len(files) > 1:
+    if len(files) > 1 and not record.numero_paginas:
         record.numero_paginas = f"{len(files)} p."
+    if not record.descripcion_fisica:
+        record.descripcion_fisica = record.numero_paginas or f"{len(files)} p."
 
     # 3. Compilar todas las 70+ fotos en un único PDF nombrado con el título del libro
     pdf_info = pdf_service.create_pdf_from_images(
@@ -73,7 +82,9 @@ async def scan_multipage_document(files: List[UploadFile] = File(...)):
 
     # 4. Asignar el enlace al documento PDF en MARC21 856 $u
     pdf_filename = pdf_info["filename"]
-    record.enlace_documento = f"http://localhost:8000/uploads/pdfs/{pdf_filename}"
+    public_base_url = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+    record.enlace_documento = f"{public_base_url}/uploads/pdfs/{pdf_filename}"
+    record.url_recurso_en_linea = record.enlace_documento
     
     db_records.append(record)
 
@@ -111,6 +122,17 @@ def export_koha_csv():
         media_type="text/csv",
         headers={
             "Content-Disposition": "attachment; filename=ciespal_koha_marc21_export.csv"
+        }
+    )
+
+@router.get("/export/marcxml")
+def export_koha_marcxml():
+    marcxml_content = marc21_exporter.generate_marcxml(db_records)
+    return Response(
+        content=marcxml_content,
+        media_type="application/marcxml+xml",
+        headers={
+            "Content-Disposition": "attachment; filename=ciespal_koha_marc21_export.xml"
         }
     )
 

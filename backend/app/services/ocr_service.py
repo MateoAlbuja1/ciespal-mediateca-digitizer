@@ -44,29 +44,13 @@ class OCRService:
                 if text and len(text.strip()) > 10:
                     return text.strip()
 
-            # Fallback inteligente si Tesseract no está instalado en el SO
+            # Sin binario de Tesseract no hay OCR real; DeepSeek Vision seguirá usando la imagen.
             return self._intelligent_fallback_ocr(image_bytes)
         except Exception as e:
             return self._intelligent_fallback_ocr(image_bytes)
 
     def _intelligent_fallback_ocr(self, image_bytes: bytes) -> str:
-        """Simulación estructurada para prototipo cuando Tesseract binario no está instalado en el sistema."""
-        return """
-        MEDIANTE LA COMUNICACIÓN Y EL DESARROLLO
-        Estudios sobre Medios Masivos en América Latina
-        
-        Autor: Benavides, Gabriel & Restrepo, María Paula
-        Edición: Centro Internacional de Estudios Superiores de Comunicación para América Latina (CIESPAL)
-        Quito, Ecuador - 2023
-        
-        ISBN: 978-9978-55-214-8
-        Páginas: 342 págs.
-        
-        Derechos reservados © 2023 CIESPAL Editorial.
-        Colección Comunicación y Sociedad, Nro. 45.
-        Descriptores: Comunicación Masiva, Medios Digitales, Periodismo, América Latina, Sociología de la Comunicación.
-        
-        Resumen: Esta obra examina el impacto de las nuevas tecnologías de la información y comunicación en la transformación de los medios comunitarios y tradicionales en la región andina. Incluye análisis empíricos y metodologías de evaluación de políticas públicas de comunicación.
-        """
+        """Fallback seguro: no devuelve datos de ejemplo para evitar registros falsos."""
+        return ""
 
 ocr_service = OCRService()

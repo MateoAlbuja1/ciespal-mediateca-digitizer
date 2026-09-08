@@ -35,71 +35,86 @@
 
     <!-- Contenido Principal -->
     <main class="app-content">
-      <!-- PANTALLA 1: CÁMARA MAXIMIZADA (ESTILO CAMSCANNER) -->
+      <!-- PANTALLA 1: PANEL DE ESCANEO -->
       <section id="screen-capture" class="screen active">
-        <div class="camera-card">
-          <div class="camera-header">
-            <span class="badge"><i data-lucide="camera"></i> Digitalizador CIESPAL</span>
-            <div class="camera-actions">
-              <button class="icon-btn" id="btn-filter-mode" title="Filtro Document Scanner (Realce / B/N / Original)"><i data-lucide="wand-2"></i></button>
-              <button class="icon-btn" id="btn-toggle-camera" title="Cambiar Cámara"><i data-lucide="refresh-cw"></i></button>
-              <button class="icon-btn" id="btn-flash" title="Iluminación"><i data-lucide="zap"></i></button>
+        <div class="scan-dashboard">
+          <div class="scan-topline">
+            <div>
+              <span class="scan-eyebrow">Mediateca</span>
+              <h2>Digitalizador CIESPAL</h2>
+            </div>
+            <button class="icon-btn" id="btn-ai-key" title="Configurar key DeepSeek"><i data-lucide="key"></i></button>
+          </div>
+
+          <div class="scan-status-panel">
+            <div class="scan-status-main">
+              <span class="scan-status-label">Lote actual</span>
+              <strong><span id="scanned-page-count">0</span> hojas</strong>
+            </div>
+            <div class="scan-status-side">
+              <span id="scan-hint">Listo para escanear</span>
             </div>
           </div>
 
-          <!-- Barra de Contador de Hojas -->
-          <div class="page-counter-bar">
-            <div class="counter-badge">
-              <i data-lucide="file-stack"></i> Hojas: <strong id="scanned-page-count">0</strong>
-            </div>
-            <button class="btn-finish-pdf hidden" id="btn-finish-pdf">
-              <i data-lucide="sparkles"></i> Compilar y Generar PDF
+          <div class="scan-actions-panel">
+            <button class="btn-smart-scan" id="btn-shutter" title="Escáner inteligente ML Kit">
+              <i data-lucide="scan-line"></i>
+              <span>Escanear</span>
             </button>
+            <label for="pdf-fallback" class="btn-secondary" title="Cargar PDF existente del libro">
+              <i data-lucide="file-up"></i> Cargar PDF
+              <input type="file" id="pdf-fallback" accept="application/pdf" class="hidden">
+            </label>
           </div>
 
-          <!-- Visor de Cámara Maximizado -->
-          <div class="viewfinder-wrapper">
-            <video id="camera-video" autoplay playsinline muted></video>
-            <canvas id="photo-canvas" class="hidden"></canvas>
-            
-            <div class="scan-frame" id="scan-frame">
-              <div class="corner top-left"></div>
-              <div class="corner top-right"></div>
-              <div class="corner bottom-left"></div>
-              <div class="corner bottom-right"></div>
-              <div class="scan-line" id="scan-line"></div>
-              <p class="scan-hint" id="scan-hint">Encuadre la hoja del libro y presione el botón de captura</p>
+          <div class="scan-summary-grid">
+            <div class="scan-summary-item">
+              <i data-lucide="sliders"></i>
+              <span>Validación</span>
+              <strong id="home-pending-count">0</strong>
             </div>
-
-            <!-- Overlay de Procesamiento -->
-            <div class="processing-overlay hidden" id="processing-overlay">
-              <div class="spinner"></div>
-              <p class="process-step" id="process-step-text">Procesando OCR e Inteligencia Artificial...</p>
-              <div class="progress-bar">
-                <div class="progress-fill" id="progress-fill"></div>
-              </div>
+            <div class="scan-summary-item">
+              <i data-lucide="database"></i>
+              <span>Registros</span>
+              <strong id="home-record-count">0</strong>
+            </div>
+            <div class="scan-summary-item">
+              <i data-lucide="file-check"></i>
+              <span>PDF</span>
+              <strong id="home-pdf-status">Pendiente</strong>
+            </div>
+            <div class="scan-summary-item">
+              <i data-lucide="key"></i>
+              <span>IA</span>
+              <strong id="home-ai-status">Sin key</strong>
             </div>
           </div>
 
-          <!-- Carrusel de Miniaturas (Estilo CamScanner) -->
           <div class="thumbnails-bar hidden" id="thumbnails-bar">
+            <div class="thumbnails-head">
+              <span>Hojas del lote</span>
+              <button class="btn-finish-pdf hidden" id="btn-finish-pdf">
+                <i data-lucide="sparkles"></i> Compilar PDF
+              </button>
+            </div>
             <div class="thumbnails-scroll" id="thumbnails-scroll">
               <!-- Se puebla dinámicamente con las fotos capturadas -->
             </div>
           </div>
 
-          <!-- Botonera de Captura -->
-          <div class="capture-controls">
-            <label for="pdf-fallback" class="btn-secondary" title="Cargar PDF existente del libro">
-              <i data-lucide="file-up"></i> Cargar PDF
-              <input type="file" id="pdf-fallback" accept="application/pdf" class="hidden">
-            </label>
+          <div class="empty-lot-panel" id="empty-lot-panel">
+            <i data-lucide="files"></i>
+            <span>Sin hojas en el lote</span>
+          </div>
 
-            <button class="btn-shutter" id="btn-shutter" title="Capturar Hoja">
-              <div class="shutter-inner"></div>
-            </button>
+          <canvas id="photo-canvas" class="hidden"></canvas>
 
-            <div class="spacer-btn"></div>
+          <div class="processing-overlay hidden" id="processing-overlay">
+            <div class="spinner"></div>
+            <p class="process-step" id="process-step-text">Procesando OCR e Inteligencia Artificial...</p>
+            <div class="progress-bar">
+              <div class="progress-fill" id="progress-fill"></div>
+            </div>
           </div>
         </div>
       </section>
@@ -153,23 +168,33 @@
             <div class="form-section-title">🏢 Publicación y Descripción Física</div>
 
             <div class="form-group">
-              <label><span class="marc-tag">264 $a</span> Lugar de Publicación (lugar_publicacion)</label>
+              <label><span class="marc-tag">260 $a</span> Lugar de Publicación (lugar_publicacion)</label>
               <input type="text" id="field-lugar" placeholder="Ciudad / País (ej. París)" class="form-control">
             </div>
 
             <div class="form-group">
-              <label><span class="marc-tag">264 $b</span> Editorial o Entidad (editorial)</label>
+              <label><span class="marc-tag">260 $b</span> Editorial o Entidad (editorial)</label>
               <input type="text" id="field-editorial" placeholder="Editorial (ej. Editorial de la UNESCO)" class="form-control">
             </div>
 
             <div class="form-group">
-              <label><span class="marc-tag">264 $c</span> Año de Publicación (anio_publicacion)</label>
+              <label><span class="marc-tag">260 $c</span> Año de Publicación (anio_publicacion)</label>
               <input type="text" id="field-anio" placeholder="Año (ej. 1976)" class="form-control">
             </div>
 
             <div class="form-group">
-              <label><span class="marc-tag">300 $a, $c</span> Descripción Física (descripcion_fisica)</label>
-              <input type="text" id="field-paginas" placeholder="ej. 72 pág. Libro rústico. 27 cm" class="form-control">
+              <label><span class="marc-tag">300 $a</span> Extensión / Páginas (numero_paginas)</label>
+              <input type="text" id="field-paginas" placeholder="ej. 72 p." class="form-control">
+            </div>
+
+            <div class="form-group">
+              <label><span class="marc-tag">300 $b</span> Soporte Físico (soporte_fisico)</label>
+              <input type="text" id="field-soporte-fisico" placeholder="ej. Libro rústico / Libro digitalizado" class="form-control">
+            </div>
+
+            <div class="form-group">
+              <label><span class="marc-tag">300 $c</span> Dimensiones (dimensiones)</label>
+              <input type="text" id="field-dimensiones" placeholder="ej. 27 cm" class="form-control">
             </div>
 
             <div class="form-group">
@@ -178,8 +203,8 @@
             </div>
 
             <div class="form-group">
-              <label><span class="marc-tag">Naturaleza</span> Tipo de Material (tipo_material)</label>
-              <input type="text" id="field-tipo-material" value="Texto" class="form-control">
+              <label><span class="marc-tag">942 $c</span> Tipo de Material Koha (tipo_material)</label>
+              <input type="text" id="field-tipo-material" value="BK" class="form-control">
             </div>
 
             <div class="form-section-title">📚 Indexación y Clasificación</div>
@@ -190,13 +215,18 @@
             </div>
 
             <div class="form-group">
-              <label><span class="marc-tag">090 $a</span> Signatura / Clasificación (clasificacion)</label>
+              <label><span class="marc-tag">084 $a</span> Signatura / Clasificación (clasificacion)</label>
               <input type="text" id="field-clasificacion" placeholder="ej. N832" class="form-control">
             </div>
 
             <div class="form-group">
-              <label><span class="marc-tag">650 $a</span> Temas y Descriptores (temas)</label>
-              <input type="text" id="field-palabras-clave" placeholder="separados por | (ej. Comunicaciones | Telecomunicaciones)" class="form-control">
+              <label><span class="marc-tag">650 $a</span> Materias Controladas (temas)</label>
+              <input type="text" id="field-temas-controlados" placeholder="si existen en el catálogo, separados por |" class="form-control">
+            </div>
+
+            <div class="form-group">
+              <label><span class="marc-tag">653 $a</span> Descriptores Libres (descriptores_libres)</label>
+              <input type="text" id="field-palabras-clave" placeholder="sugeridos por IA, separados por |" class="form-control">
             </div>
 
             <div class="form-group">
@@ -232,21 +262,35 @@
         <div class="export-header-card">
           <div>
             <h3><i data-lucide="file-spreadsheet"></i> Lote de Exportación para Koha</h3>
-            <p>Registros validados en formato estándar MARC21</p>
+            <p>Registros validados en formato MARC21 para revisión e importación</p>
           </div>
-          <button id="btn-download-csv" class="btn-primary">
-            <i data-lucide="download"></i> Descargar CSV Koha
-          </button>
+          <div class="export-actions">
+            <button id="btn-download-csv" class="btn-secondary">
+              <i data-lucide="table"></i> CSV
+            </button>
+            <button id="btn-download-excel" class="btn-secondary">
+              <i data-lucide="file-spreadsheet"></i> Excel
+            </button>
+            <button id="btn-download-marcxml" class="btn-primary">
+              <i data-lucide="file-code"></i> MARCXML
+            </button>
+          </div>
         </div>
 
-        <div class="table-responsive">
-          <table class="koha-table">
+        <div class="records-strip hidden" id="records-strip"></div>
+
+        <div class="table-responsive editable-table-responsive">
+          <table class="koha-table editable-koha-table">
             <thead>
               <tr>
                 <th>020a (ISBN)</th>
-                <th>245a (Título / PDF)</th>
+                <th>245a (Título)</th>
                 <th>100a (Autor)</th>
+                <th>260c (Año)</th>
                 <th>300a (Págs)</th>
+                <th>084a (Clasif.)</th>
+                <th>650a (Materias)</th>
+                <th>653a (Descriptores)</th>
                 <th>856u (PDF)</th>
                 <th>Acción</th>
               </tr>
@@ -259,22 +303,29 @@
       </section>
     </main>
 
-    <!-- Modal de Previsualización, Reemplazo y Borrado de Hojas -->
+    <!-- Modal de Previsualización y Borrado de Hojas -->
     <div class="page-modal hidden" id="page-modal">
       <div class="page-modal-content">
         <div class="page-modal-header">
           <span id="modal-page-title" class="modal-title">Hoja #1</span>
           <button type="button" class="icon-btn-close" id="btn-close-modal"><i data-lucide="x"></i></button>
         </div>
-        <div class="page-modal-body">
+        <div class="page-modal-body page-review-body">
+          <button type="button" class="modal-nav-arrow modal-nav-prev" id="btn-modal-prev-page" title="Hoja anterior">
+            <i data-lucide="chevron-left"></i>
+          </button>
           <img id="modal-page-img" src="" alt="Previsualización de hoja escaneada">
+          <button type="button" class="modal-nav-arrow modal-nav-next" id="btn-modal-next-page" title="Hoja siguiente">
+            <i data-lucide="chevron-right"></i>
+          </button>
         </div>
+        <div class="modal-thumbnails-strip" id="modal-thumbnails-strip"></div>
         <div class="page-modal-footer">
           <button type="button" class="btn-danger" id="btn-delete-page">
             <i data-lucide="trash-2"></i> Eliminar
           </button>
-          <button type="button" class="btn-retake" id="btn-retake-page">
-            <i data-lucide="camera"></i> Repetir / Volver a Tomar
+          <button type="button" class="btn-retake" id="btn-add-more-pages">
+            <i data-lucide="scan-line"></i> Escanear más
           </button>
         </div>
       </div>
@@ -319,10 +370,44 @@
       </div>
     </div>
 
+    <div class="page-modal hidden ai-key-modal" id="ai-key-modal">
+      <div class="page-modal-content ai-key-content">
+        <div class="page-modal-header">
+          <span class="modal-title"><i data-lucide="key"></i> Key DeepSeek</span>
+          <button type="button" class="icon-btn-close" id="btn-close-ai-key"><i data-lucide="x"></i></button>
+        </div>
+        <div class="ai-key-body">
+          <div class="ai-key-current" id="ai-key-current">Sin key guardada</div>
+          <label class="ai-key-label" for="ai-key-input">API key</label>
+          <div class="ai-key-input-row">
+            <input
+              type="password"
+              id="ai-key-input"
+              class="form-control ai-key-input"
+              placeholder="sk-..."
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+            >
+            <button type="button" class="icon-btn ai-key-eye" id="btn-toggle-ai-key" title="Mostrar u ocultar key">
+              <i data-lucide="eye"></i>
+            </button>
+          </div>
+          <p class="ai-key-status" id="ai-key-status">La key se guarda solo en este celular.</p>
+        </div>
+        <div class="page-modal-footer ai-key-footer">
+          <button type="button" class="btn-cancel" id="btn-delete-ai-key"><i data-lucide="trash-2"></i> Borrar</button>
+          <button type="button" class="btn-cancel" id="btn-cancel-ai-key">Cancelar</button>
+          <button type="button" class="btn-secondary" id="btn-test-ai-key"><i data-lucide="plug-zap"></i> Probar</button>
+          <button type="button" class="btn-primary" id="btn-save-ai-key"><i data-lucide="check"></i> Guardar</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Barra de Navegación Inferior Monocroma -->
     <nav class="app-bottom-nav">
       <button class="nav-item active" data-target="screen-capture">
-        <i data-lucide="camera"></i>
+        <i data-lucide="scan-line"></i>
         <span>Escáner</span>
       </button>
       <button class="nav-item" data-target="screen-review">
@@ -339,8 +424,7 @@
 
   <!-- OpenCV.js for Adobe Scan / CamScanner style document 4-corner perspective auto-crop -->
   <script src="opencv.js" async></script>
-  <script src="config.js?v=2"></script>
-  <script src="app.js?v=2"></script>
+  <script src="app.js"></script>
   <script>
     lucide.createIcons();
   </script>
