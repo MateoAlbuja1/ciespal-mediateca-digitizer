@@ -293,7 +293,7 @@ public class MainActivity extends BridgeActivity {
             "Descargas CIESPAL",
             NotificationManager.IMPORTANCE_DEFAULT
         );
-        channel.setDescription("Avisos cuando se guardan PDF, CSV o MARCXML.");
+        channel.setDescription("Avisos cuando se guardan PDF, Excel o MARCXML.");
         notificationManager.createNotificationChannel(channel);
     }
 

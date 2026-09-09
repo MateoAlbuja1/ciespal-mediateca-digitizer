@@ -67,35 +67,25 @@
             </label>
           </div>
 
-          <div class="scan-summary-grid">
-            <div class="scan-summary-item">
-              <i data-lucide="sliders"></i>
-              <span>Validación</span>
-              <strong id="home-pending-count">0</strong>
+          <div class="index-mode-panel" aria-label="Modo de índice para IA">
+            <div class="index-mode-meta">
+              <i data-lucide="list-tree"></i>
+              <span>Índice IA</span>
             </div>
-            <div class="scan-summary-item">
-              <i data-lucide="database"></i>
-              <span>Registros</span>
-              <strong id="home-record-count">0</strong>
-            </div>
-            <div class="scan-summary-item">
-              <i data-lucide="file-check"></i>
-              <span>PDF</span>
-              <strong id="home-pdf-status">Pendiente</strong>
-            </div>
-            <div class="scan-summary-item">
-              <i data-lucide="key"></i>
-              <span>IA</span>
-              <strong id="home-ai-status">Sin key</strong>
+            <div class="index-mode-toggle" role="group" aria-label="Modo de índice">
+              <button type="button" class="index-mode-option active" data-index-mode="existing" aria-pressed="true" title="Transcribir un índice existente">Índice</button>
+              <button type="button" class="index-mode-option" data-index-mode="generated" aria-pressed="false" title="Crear índice desde encabezados visibles">Sin índice</button>
             </div>
           </div>
+
+          <button class="btn-finish-pdf hidden" id="btn-finish-pdf">
+            <i data-lucide="sparkles"></i>
+            <span>Generar ficha y PDF</span>
+          </button>
 
           <div class="thumbnails-bar hidden" id="thumbnails-bar">
             <div class="thumbnails-head">
               <span>Hojas del lote</span>
-              <button class="btn-finish-pdf hidden" id="btn-finish-pdf">
-                <i data-lucide="sparkles"></i> Compilar PDF
-              </button>
             </div>
             <div class="thumbnails-scroll" id="thumbnails-scroll">
               <!-- Se puebla dinámicamente con las fotos capturadas -->
@@ -257,17 +247,14 @@
         </form>
       </section>
 
-      <!-- PANTALLA 3: HISTORIAL & EXPORTACIÓN CSV KOHA -->
+      <!-- PANTALLA 3: HISTORIAL & EXPORTACIÓN KOHA -->
       <section id="screen-export" class="screen">
         <div class="export-header-card">
           <div>
-            <h3><i data-lucide="file-spreadsheet"></i> Lote de Exportación para Koha</h3>
-            <p>Registros validados en formato MARC21 para revisión e importación</p>
+            <h3><i data-lucide="file-spreadsheet"></i> Exportar libro seleccionado</h3>
+            <p>Excel y MARCXML se descargan solo del registro activo</p>
           </div>
           <div class="export-actions">
-            <button id="btn-download-csv" class="btn-secondary">
-              <i data-lucide="table"></i> CSV
-            </button>
             <button id="btn-download-excel" class="btn-secondary">
               <i data-lucide="file-spreadsheet"></i> Excel
             </button>
@@ -344,27 +331,6 @@
         <div class="page-modal-footer" style="flex-wrap: wrap; gap: 8px;">
           <button type="button" class="btn-primary" id="btn-open-external-pdf" style="flex: 1;">
             <i data-lucide="download"></i> Descargar PDF
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Modal de Visor CSV Koha -->
-    <div class="page-modal hidden" id="csv-viewer-modal" style="z-index: 9999;">
-      <div class="page-modal-content" style="max-height: 85vh;">
-        <div class="page-modal-header">
-          <span class="modal-title">📊 Exportación Koha MARC21 (CSV)</span>
-          <button type="button" class="icon-btn-close" id="btn-close-csv-modal"><i data-lucide="x"></i></button>
-        </div>
-        <div class="page-modal-body" style="overflow: auto; max-height: 50vh; font-family: monospace; font-size: 0.72rem; white-space: pre-wrap; background: #181818; padding: 12px; border-radius: 8px; color: #4ade80;" id="csv-modal-content">
-          <!-- Contenido CSV -->
-        </div>
-        <div class="page-modal-footer" style="gap: 8px;">
-          <button type="button" class="btn-primary" id="btn-copy-csv" style="flex: 1;">
-            <i data-lucide="copy"></i> Copiar CSV
-          </button>
-          <button type="button" class="btn-retake" id="btn-download-csv-file" style="flex: 1;">
-            <i data-lucide="download"></i> Descargar CSV
           </button>
         </div>
       </div>

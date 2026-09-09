@@ -1,7 +1,7 @@
 {
   "appId": "org.ciespal.mediateca.digitizer",
   "appName": "CIESPAL",
-  "webDir": "dist",
+  "webDir": "www",
   "plugins": {
     "CapacitorHttp": {
       "enabled": true

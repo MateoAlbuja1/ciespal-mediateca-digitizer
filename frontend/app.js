@@ -5,10 +5,18 @@
 
 const DEEPSEEK_CONFIG = {
   keyStorage: 'ciespal_deepseek_api_key',
+  indexModeStorage: 'ciespal_index_extraction_mode',
   apiUrl: 'https://api.deepseek.com/chat/completions',
   modelsUrl: 'https://api.deepseek.com/models',
   visionModel: 'deepseek-v4-flash-vision-exp',
-  maxDirectPages: 12
+  maxDirectPages: 80,
+  existingIndexMaxPages: 32,
+  generatedIndexMaxPages: 80
+};
+
+const INDEX_EXTRACTION_MODES = {
+  existing: 'existing',
+  generated: 'generated'
 };
 
 const SCAN_CONFIG = {
@@ -46,6 +54,7 @@ const state = {
   bookPagesBuffer: [],
   bookPagesBase64: [],
   detectedIndexPages: [],
+  indexExtractionMode: getStoredIndexExtractionMode(),
   scanFilterMode: 'magic_color', // 'magic_color' (Fondo Blanco Inteligente), 'bw' (B/N OpenCV), 'original'
   cameraStream: null,
   cameraReady: false,
@@ -73,6 +82,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   initEvents();
   refreshDeepSeekKeyButton();
   await restoreDraft();
+  renderIndexExtractionMode();
   renderKohaRecordsTable();
   updatePageCounter();
   renderThumbnails();
@@ -189,6 +199,9 @@ function initEvents() {
   document.getElementById('btn-shutter').addEventListener('click', startSmartDocumentScan);
   document.getElementById('btn-finish-pdf').addEventListener('click', processBookWithDeepSeekAI);
   document.getElementById('pdf-fallback').addEventListener('change', handlePDFUpload);
+  document.querySelectorAll('[data-index-mode]').forEach(button => {
+    button.addEventListener('click', () => setIndexExtractionMode(button.dataset.indexMode));
+  });
   document.getElementById('btn-ai-key')?.addEventListener('click', () => configureDeepSeekKey());
   document.getElementById('btn-close-ai-key')?.addEventListener('click', () => closeDeepSeekKeyModal(getDeepSeekApiKey()));
   document.getElementById('btn-cancel-ai-key')?.addEventListener('click', () => closeDeepSeekKeyModal(getDeepSeekApiKey()));
@@ -208,7 +221,6 @@ function initEvents() {
   });
 
   document.getElementById('marc-form').addEventListener('submit', handleFormSubmit);
-  document.getElementById('btn-download-csv').addEventListener('click', downloadKohaCSV);
   document.getElementById('btn-download-excel')?.addEventListener('click', downloadKohaExcel);
   document.getElementById('btn-download-marcxml')?.addEventListener('click', downloadKohaMARCXML);
   document.getElementById('btn-discard')?.addEventListener('click', () => {
@@ -329,6 +341,7 @@ function serializeDraft() {
     bookPagesBase64: state.bookPagesBase64 || [],
     savedPagesBase64: state.savedPagesBase64 || [],
     detectedIndexPages: state.detectedIndexPages || [],
+    indexExtractionMode: getIndexExtractionMode(),
     scanFilterMode: state.scanFilterMode || 'magic_color'
   };
 }
@@ -344,8 +357,10 @@ async function restoreDraft() {
     state.bookPagesBase64 = Array.isArray(draft.bookPagesBase64) ? draft.bookPagesBase64 : [];
     state.savedPagesBase64 = Array.isArray(draft.savedPagesBase64) ? draft.savedPagesBase64 : [];
     state.detectedIndexPages = Array.isArray(draft.detectedIndexPages) ? draft.detectedIndexPages : [];
+    state.indexExtractionMode = normalizeIndexExtractionMode(draft.indexExtractionMode || state.indexExtractionMode);
     state.scanFilterMode = draft.scanFilterMode || state.scanFilterMode || 'magic_color';
-    collapseRecordsToActiveDraft();
+    reconcileStoredRecords();
+    migrateLegacySavedPagesToActiveRecord();
     state.bookPagesBuffer = state.bookPagesBase64.map(imageBase64ToBlob);
     state.draftLoaded = true;
 
@@ -371,36 +386,98 @@ function scheduleDraftSave() {
   }, DRAFT_CONFIG.debounceMs);
 }
 
-function collapseRecordsToActiveDraft() {
-  const records = Array.isArray(state.records) ? state.records.filter(Boolean) : [];
-  const active = records.find(rec => rec.id && rec.id === state.activeRecordId)
-    || state.currentRecord
-    || records[0]
-    || null;
+function reconcileStoredRecords() {
+  const records = [];
+  const indexById = new Map();
+  const addRecord = record => {
+    if (!record || typeof record !== 'object') return;
+    const normalized = normalizeStoredRecord(record);
+    const existingIndex = indexById.get(normalized.id);
+    if (existingIndex === undefined) {
+      indexById.set(normalized.id, records.length);
+      records.push(normalized);
+    } else {
+      records[existingIndex] = mergeStoredRecords(records[existingIndex], normalized);
+    }
+  };
 
-  if (!active) {
-    clearRecordState({ resetForm: false });
-    return;
-  }
+  (Array.isArray(state.records) ? state.records : []).forEach(addRecord);
+  addRecord(state.currentRecord);
+  state.records = records;
 
-  if (!active.id) active.id = 'ciespal_' + Date.now().toString(36);
+  const active = state.records.find(rec => rec.id === state.activeRecordId) || state.records[0] || null;
   state.currentRecord = active;
-  state.activeRecordId = active.id;
-  state.records = [active];
+  state.activeRecordId = active?.id || null;
+  if (!active) clearRecordState({ resetForm: false, preserveLibrary: true });
+}
+
+function migrateLegacySavedPagesToActiveRecord() {
+  if (!Array.isArray(state.savedPagesBase64) || !state.savedPagesBase64.length) return;
+  const active = state.records.find(rec => rec.id === state.activeRecordId) || state.currentRecord;
+  if (!active || getRecordPages(active).length) return;
+
+  active.pagesBase64 = [...state.savedPagesBase64];
+  active.pageCount = active.pageCount || active.pagesBase64.length;
+  state.currentRecord = active;
 }
 
 function setActiveRecord(record) {
-  if (!record) return;
-  if (!record.id) record.id = 'ciespal_' + Date.now().toString(36);
-  state.currentRecord = record;
-  state.activeRecordId = record.id;
-  state.records = [record];
+  if (!record) return null;
+  const normalized = normalizeStoredRecord(record);
+  const existingIndex = state.records.findIndex(rec => rec.id === normalized.id);
+
+  if (existingIndex >= 0) {
+    state.records[existingIndex] = mergeStoredRecords(state.records[existingIndex], normalized);
+    state.currentRecord = state.records[existingIndex];
+  } else {
+    state.records.push(normalized);
+    state.currentRecord = normalized;
+  }
+
+  state.activeRecordId = state.currentRecord.id;
+  return state.currentRecord;
+}
+
+function normalizeStoredRecord(record) {
+  const id = record.id || generateRecordId();
+  const pagesBase64 = getRecordPages(record);
+  return {
+    ...record,
+    id,
+    pagesBase64,
+    pageCount: record.pageCount || pagesBase64.length || parseInt(record.numero_paginas, 10) || 0,
+    savedAt: record.savedAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function mergeStoredRecords(existing, incoming) {
+  const incomingPages = getRecordPages(incoming);
+  const existingPages = getRecordPages(existing);
+  const pagesBase64 = incomingPages.length ? incomingPages : existingPages;
+  return {
+    ...existing,
+    ...incoming,
+    pagesBase64,
+    pageCount: incoming.pageCount || existing.pageCount || pagesBase64.length || parseInt(incoming.numero_paginas, 10) || 0,
+    savedAt: existing.savedAt || incoming.savedAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function generateRecordId() {
+  return 'ciespal_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
 }
 
 function clearRecordState(options = {}) {
+  const preserveLibrary = Boolean(options.preserveLibrary);
   state.currentRecord = null;
-  state.records = [];
-  state.activeRecordId = null;
+  if (!preserveLibrary) {
+    state.records = [];
+    state.activeRecordId = null;
+  } else if (!state.records.some(rec => rec.id === state.activeRecordId)) {
+    state.activeRecordId = state.records[0]?.id || null;
+  }
 
   const badge = document.getElementById('record-id-badge');
   if (badge) badge.textContent = 'ID: --';
@@ -423,6 +500,58 @@ async function saveDraftNow() {
   }
 }
 
+function normalizeIndexExtractionMode(mode) {
+  return mode === INDEX_EXTRACTION_MODES.generated
+    ? INDEX_EXTRACTION_MODES.generated
+    : INDEX_EXTRACTION_MODES.existing;
+}
+
+function getStoredIndexExtractionMode() {
+  try {
+    return normalizeIndexExtractionMode(localStorage.getItem(DEEPSEEK_CONFIG.indexModeStorage));
+  } catch (err) {
+    return INDEX_EXTRACTION_MODES.existing;
+  }
+}
+
+function getIndexExtractionMode() {
+  state.indexExtractionMode = normalizeIndexExtractionMode(state.indexExtractionMode);
+  return state.indexExtractionMode;
+}
+
+function setIndexExtractionMode(mode) {
+  state.indexExtractionMode = normalizeIndexExtractionMode(mode);
+  try {
+    localStorage.setItem(DEEPSEEK_CONFIG.indexModeStorage, state.indexExtractionMode);
+  } catch (err) {
+    console.warn('No se pudo guardar el modo de índice:', err);
+  }
+  renderIndexExtractionMode();
+  scheduleDraftSave();
+}
+
+function renderIndexExtractionMode() {
+  const mode = getIndexExtractionMode();
+  document.querySelectorAll('[data-index-mode]').forEach(button => {
+    const active = button.dataset.indexMode === mode;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+
+  const finishButton = document.getElementById('btn-finish-pdf');
+  if (finishButton) {
+    finishButton.title = mode === INDEX_EXTRACTION_MODES.generated
+      ? 'Generar ficha, PDF e índice desde encabezados'
+      : 'Generar ficha, PDF y transcribir índice existente';
+  }
+}
+
+function getAiPageLimitForMode(mode) {
+  return normalizeIndexExtractionMode(mode) === INDEX_EXTRACTION_MODES.generated
+    ? DEEPSEEK_CONFIG.generatedIndexMaxPages
+    : DEEPSEEK_CONFIG.existingIndexMaxPages;
+}
+
 function getDeepSeekApiKey() {
   return (localStorage.getItem(DEEPSEEK_CONFIG.keyStorage) || '').trim();
 }
@@ -441,8 +570,6 @@ function refreshDeepSeekKeyButton() {
   btn.title = key
     ? `Key DeepSeek configurada (${maskApiKey(key)})`
     : 'Configurar key DeepSeek';
-  const aiStatus = document.getElementById('home-ai-status');
-  if (aiStatus) aiStatus.textContent = key ? 'Lista' : 'Sin key';
 }
 
 async function configureDeepSeekKey(options = {}) {
@@ -1252,7 +1379,7 @@ function saveProcessedPageCanvas(canvas, targetIndex = null, qualityLabel = 'gua
   const blob = dataURLToBlob(dataUrl);
   const hint = document.getElementById('scan-hint');
   const startsFreshLot = targetIndex === null && state.bookPagesBase64.length === 0;
-  if (startsFreshLot) clearRecordState();
+  if (startsFreshLot) clearRecordState({ preserveLibrary: true });
   state.savedPagesBase64 = [];
 
   if (targetIndex !== null && targetIndex >= 0 && targetIndex < state.bookPagesBase64.length) {
@@ -1268,7 +1395,7 @@ function saveProcessedPageCanvas(canvas, targetIndex = null, qualityLabel = 'gua
 
   updatePageCounter();
   renderThumbnails();
-  if (startsFreshLot) renderKohaRecordsTable();
+  if (startsFreshLot) renderRecordsStrip();
   scheduleDraftSave();
 }
 
@@ -1423,7 +1550,7 @@ function saveScannedPageBase64(base64, targetIndex = null, qualityLabel = 'guard
   const blob = imageBase64ToBlob(cleanBase64);
   const hint = document.getElementById('scan-hint');
   const startsFreshLot = targetIndex === null && state.bookPagesBase64.length === 0;
-  if (startsFreshLot) clearRecordState();
+  if (startsFreshLot) clearRecordState({ preserveLibrary: true });
   state.savedPagesBase64 = [];
 
   if (targetIndex !== null && targetIndex >= 0 && targetIndex < state.bookPagesBase64.length) {
@@ -1439,7 +1566,7 @@ function saveScannedPageBase64(base64, targetIndex = null, qualityLabel = 'guard
 
   updatePageCounter();
   renderThumbnails();
-  if (startsFreshLot) renderKohaRecordsTable();
+  if (startsFreshLot) renderRecordsStrip();
   scheduleDraftSave();
 }
 
@@ -2532,8 +2659,8 @@ async function handlePDFUpload(e) {
     scheduleDraftSave();
     hideProcessingOverlay();
 
-    alert(`Se cargó el PDF con ${numPages} hojas.\n\nPresione 'Compilar y Generar PDF' para extraer los metadatos con IA.`);
-    document.getElementById('scan-hint').textContent = `PDF cargado: ${numPages} hojas. Presione 'Compilar y Generar PDF'.`;
+    alert(`Se cargó el PDF con ${numPages} hojas.\n\nPresione 'Generar ficha y PDF' para extraer los metadatos con IA.`);
+    document.getElementById('scan-hint').textContent = `PDF cargado: ${numPages} hojas. Presione 'Generar ficha y PDF'.`;
 
   } catch (err) {
     hideProcessingOverlay();
@@ -2689,40 +2816,55 @@ function updatePageCounter() {
 
 function updateHomeOverview() {
   const pages = state.bookPagesBase64.length;
-  const records = state.records.length ? 1 : 0;
-  const pending = records;
-  const pdfPages = getCompiledPdfPages().length;
 
   const emptyPanel = document.getElementById('empty-lot-panel');
   if (emptyPanel) emptyPanel.classList.toggle('hidden', pages > 0);
-
-  const pendingEl = document.getElementById('home-pending-count');
-  if (pendingEl) pendingEl.textContent = pending;
-
-  const recordEl = document.getElementById('home-record-count');
-  if (recordEl) recordEl.textContent = records;
-
-  const pdfEl = document.getElementById('home-pdf-status');
-  if (pdfEl) {
-    pdfEl.textContent = state.savedPagesBase64.length
-      ? 'Listo'
-      : pdfPages
-        ? 'Pendiente'
-        : 'Sin lote';
-  }
-
-  const aiStatus = document.getElementById('home-ai-status');
-  if (aiStatus) aiStatus.textContent = getDeepSeekApiKey() ? 'Lista' : 'Sin key';
 }
 
-function getCompiledPdfPages() {
+function getRecordPages(record = {}) {
+  if (Array.isArray(record.pagesBase64) && record.pagesBase64.length) return record.pagesBase64;
+  if (Array.isArray(record.savedPagesBase64) && record.savedPagesBase64.length) return record.savedPagesBase64;
+  return [];
+}
+
+function getRecordPageCount(record = {}) {
+  const pages = getRecordPages(record);
+  return record.pageCount || pages.length || parseInt(record.numero_paginas, 10) || 0;
+}
+
+function getCurrentPagesSnapshot() {
   if (Array.isArray(state.savedPagesBase64) && state.savedPagesBase64.length) {
-    return state.savedPagesBase64;
+    return [...state.savedPagesBase64];
   }
   if (Array.isArray(state.bookPagesBase64) && state.bookPagesBase64.length) {
-    return state.bookPagesBase64;
+    return [...state.bookPagesBase64];
   }
   return [];
+}
+
+function attachPagesToRecord(record, totalPages, pagesOverride = null) {
+  const explicitPages = Array.isArray(pagesOverride) ? pagesOverride : [];
+  const existingPages = getRecordPages(record);
+  const pagesBase64 = explicitPages.length ? [...explicitPages] : existingPages.length ? existingPages : getCurrentPagesSnapshot();
+  return {
+    ...record,
+    pagesBase64,
+    pageCount: totalPages || pagesBase64.length || getRecordPageCount(record)
+  };
+}
+
+function getCompiledPdfPages(record = null) {
+  if (record) {
+    const recordPages = getRecordPages(record);
+    if (recordPages.length) return recordPages;
+  }
+
+  const currentPages = getCurrentPagesSnapshot();
+  if (currentPages.length) {
+    return currentPages;
+  }
+
+  return getRecordPages(state.currentRecord || getActiveExportRecord());
 }
 
 function resetScanBuffer(options = {}) {
@@ -2734,7 +2876,7 @@ function resetScanBuffer(options = {}) {
   if (!preserveSavedPages) state.savedPagesBase64 = [];
   state.detectedIndexPages = [];
   state.retakeIndex = null;
-  if (!preserveRecord) clearRecordState();
+  if (!preserveRecord) clearRecordState({ preserveLibrary: true });
   updatePageCounter();
   renderThumbnails();
   if (!preserveRecord) renderKohaRecordsTable();
@@ -2797,18 +2939,26 @@ async function processBookWithDeepSeekAI() {
   if (!apiKey) return;
 
   const totalPages = state.bookPagesBuffer.length;
-  showProcessingOverlay('Preparando hojas para DeepSeek...', 10);
+  const indexMode = getIndexExtractionMode();
+  const modeText = indexMode === INDEX_EXTRACTION_MODES.generated
+    ? 'sin índice'
+    : 'con índice';
+  showProcessingOverlay(`Preparando hojas (${modeText}) para DeepSeek...`, 10);
 
   try {
-    const selectedIndexes = selectPageIndexesForAi(totalPages);
+    const selectedIndexes = selectPageIndexesForAi(totalPages, getAiPageLimitForMode(indexMode));
     const content = [{
       type: 'text',
-      text: buildDeepSeekExtractionPrompt(totalPages, selectedIndexes)
+      text: buildDeepSeekExtractionPrompt(totalPages, selectedIndexes, indexMode)
     }];
 
     for (let i = 0; i < selectedIndexes.length; i++) {
       const pageIndex = selectedIndexes[i];
       const resizedBase64 = await resizeBase64ForAi(state.bookPagesBase64[pageIndex], 1200);
+      content.push({
+        type: 'text',
+        text: `Hoja escaneada ${pageIndex + 1} de ${totalPages}.`
+      });
       content.push({
         type: 'image_url',
         image_url: {
@@ -2827,7 +2977,7 @@ async function processBookWithDeepSeekAI() {
     const result = await deepSeekHttpRequest(DEEPSEEK_CONFIG.apiUrl, {
       method: 'POST',
       apiKey,
-      timeoutMs: 180000,
+      timeoutMs: indexMode === INDEX_EXTRACTION_MODES.generated ? 300000 : 180000,
       data: {
         model: DEEPSEEK_CONFIG.visionModel,
         messages: [
@@ -2862,12 +3012,13 @@ async function processBookWithDeepSeekAI() {
 
     updateProcessingProgress('Extracción MARC21 finalizada.', 100);
 
-    state.savedPagesBase64 = [...state.bookPagesBase64];
+    const completedPages = [...state.bookPagesBase64];
+    state.savedPagesBase64 = completedPages;
 
     setTimeout(() => {
       hideProcessingOverlay();
       resetScanBuffer({ preserveSavedPages: true, preserveRecord: true });
-      onBookScanCompleted(record, totalPages);
+      onBookScanCompleted(record, totalPages, completedPages);
     }, 400);
 
   } catch (err) {
@@ -2877,33 +3028,58 @@ async function processBookWithDeepSeekAI() {
     const errorMsg = getDeepSeekDirectErrorMessage(err);
     alert(`Error al procesar con IA:\n${errorMsg}\n\nSe cargará una plantilla vacía para completar manualmente.`);
 
-    state.savedPagesBase64 = [...state.bookPagesBase64];
+    const completedPages = [...state.bookPagesBase64];
+    state.savedPagesBase64 = completedPages;
     resetScanBuffer({ preserveSavedPages: true, preserveRecord: true });
-    onBookScanCompleted(createFallbackRecord(totalPages), totalPages);
+    onBookScanCompleted(createFallbackRecord(totalPages), totalPages, completedPages);
   }
 }
 
-function selectPageIndexesForAi(totalPages) {
-  const indexes = new Set();
-  const firstPages = Math.min(totalPages, 10);
-  for (let i = 0; i < firstPages; i++) indexes.add(i);
+function selectPageIndexesForAi(totalPages, maxDirectPages = DEEPSEEK_CONFIG.maxDirectPages) {
+  const safeLimit = Number.isFinite(maxDirectPages) ? Math.max(0, maxDirectPages) : DEEPSEEK_CONFIG.maxDirectPages;
+  const maxPages = Math.min(totalPages, safeLimit);
+  if (maxPages === 0) return [];
+
+  const priority = [];
+  const seen = new Set();
+  const addIndex = idx => {
+    if (idx < 0 || idx >= totalPages || seen.has(idx)) return;
+    seen.add(idx);
+    priority.push(idx);
+  };
 
   (state.detectedIndexPages || []).forEach(idx => {
-    if (idx >= 0 && idx < totalPages) indexes.add(idx);
+    addIndex(idx - 1);
+    addIndex(idx);
+    addIndex(idx + 1);
   });
 
-  if (totalPages > 10) indexes.add(totalPages - 1);
+  const frontPages = Math.min(totalPages, Math.min(8, maxPages));
+  for (let i = 0; i < frontPages; i++) addIndex(i);
 
-  return [...indexes]
-    .sort((a, b) => a - b)
-    .slice(0, DEEPSEEK_CONFIG.maxDirectPages);
+  if (totalPages > 1) addIndex(totalPages - 1);
+
+  const intervals = Math.max(1, maxPages - 1);
+  for (let i = 0; priority.length < maxPages && i <= intervals; i++) {
+    addIndex(Math.round((i / intervals) * (totalPages - 1)));
+  }
+
+  for (let i = 0; priority.length < maxPages && i < totalPages; i++) {
+    addIndex(i);
+  }
+
+  return priority
+    .slice(0, maxPages)
+    .sort((a, b) => a - b);
 }
 
-function buildDeepSeekExtractionPrompt(totalPages, selectedIndexes) {
+function buildDeepSeekExtractionPrompt(totalPages, selectedIndexes, indexMode = getIndexExtractionMode()) {
   const selectedPages = selectedIndexes.map(idx => idx + 1).join(', ');
+  const indexRules = buildIndexExtractionPromptRules(indexMode);
   return `
 Eres un bibliotecario experto en catalogación MARC21/Koha para la Mediateca CIESPAL.
 Se escanearon ${totalPages} hojas. Para extraer metadatos estás viendo estas hojas: ${selectedPages}.
+Cada imagen está precedida por una etiqueta "Hoja escaneada N de ${totalPages}". Usa esa etiqueta como referencia cuando no se vea un número de página impreso.
 
 Extrae metadatos bibliográficos reales usando solo texto visible. Si un dato no aparece claramente, deja el campo vacío. No inventes ISBN, editorial, autores, año, capítulos, clasificación ni materias por contexto.
 
@@ -2917,9 +3093,7 @@ Perfil Koha observado para CIESPAL:
 - Tipo local Koha para libros: 942 $c = "BK".
 
 Reglas para tabla_contenidos:
-1. Busca páginas tituladas "ÍNDICE", "INDICE", "CONTENIDO", "TABLA DE CONTENIDOS", "SUMARIO", "INDEX" o "TABLE OF CONTENTS".
-2. Si existe índice, transcríbelo línea por línea.
-3. Si no existe índice visible, deja tabla_contenidos vacío.
+${indexRules}
 
 Devuelve SOLO JSON válido con esta forma:
 {
@@ -2944,6 +3118,29 @@ Devuelve SOLO JSON válido con esta forma:
   "resumen": "",
   "tabla_contenidos": ""
 }`.trim();
+}
+
+function buildIndexExtractionPromptRules(indexMode) {
+  if (normalizeIndexExtractionMode(indexMode) === INDEX_EXTRACTION_MODES.generated) {
+    return `
+Modo seleccionado: SIN ÍNDICE. El usuario indicó que el libro no trae índice formal.
+1. Si aun así encuentras páginas tituladas "ÍNDICE", "INDICE", "CONTENIDO", "TABLA DE CONTENIDOS", "SUMARIO", "INDEX" o "TABLE OF CONTENTS", transcríbelas línea por línea.
+2. Si no existe índice formal, crea tabla_contenidos a partir de títulos, capítulos, unidades, lecciones, secciones o encabezados visibles dentro del libro.
+3. Para cada entrada creada, incluye el número de página impreso si se ve. Si no se ve, usa la hoja escaneada correspondiente, por ejemplo: "Lección 1: Mi rutina diaria - hoja 7".
+4. No inventes capítulos que no aparezcan como encabezado visible. Solo usa encabezados/títulos realmente leídos en las imágenes.
+5. Conserva numeración y páginas cuando sean visibles. Usa líneas separadas, por ejemplo: "1. Introducción - p. 3".
+6. Si solo ves una muestra del libro y no todas las hojas, genera el índice con los encabezados visibles en esa muestra.
+7. Devuelve ese dato únicamente en tabla_contenidos. No uses claves como indice, contenido, sumario ni toc.`.trim();
+  }
+
+  return `
+Modo seleccionado: ÍNDICE. El usuario indicó que el libro debería traer índice formal.
+1. Busca páginas tituladas "ÍNDICE", "INDICE", "CONTENIDO", "TABLA DE CONTENIDOS", "SUMARIO", "INDEX" o "TABLE OF CONTENTS".
+2. Si existe índice, transcríbelo línea por línea.
+3. Si no encuentras un índice formal visible, deja tabla_contenidos como "".
+4. No crees una tabla de contenidos desde encabezados sueltos en este modo.
+5. Conserva numeración y páginas cuando sean visibles. Usa líneas separadas, por ejemplo: "1. Introducción - p. 3".
+6. Devuelve ese dato únicamente en tabla_contenidos. No uses claves como indice, contenido, sumario ni toc.`.trim();
 }
 
 async function deepSeekHttpRequest(url, { method = 'GET', apiKey, data, timeoutMs = 180000 } = {}) {
@@ -3070,7 +3267,7 @@ function normalizeDeepSeekRecord(extracted, totalPages) {
     descriptores_libres: pickAiText(extracted, 'descriptores_libres', 'palabras_clave'),
     clasificacion: pickAiText(extracted, 'clasificacion'),
     resumen: pickAiText(extracted, 'resumen'),
-    tabla_contenidos: pickAiText(extracted, 'tabla_contenidos'),
+    tabla_contenidos: pickAiTableOfContents(extracted),
     url_recurso_en_linea: filename,
     enlace_documento: filename
   }, totalPages);
@@ -3082,6 +3279,72 @@ function pickAiText(data, ...keys) {
     if (value) return value;
   }
   return '';
+}
+
+function pickAiTableOfContents(data) {
+  const rawValue = pickAiValue(
+    data,
+    'tabla_contenidos',
+    'tabla_de_contenidos',
+    'indice',
+    'índice',
+    'contenido',
+    'contenidos',
+    'sumario',
+    'table_of_contents',
+    'toc'
+  );
+  return aiTableOfContentsToText(rawValue);
+}
+
+function pickAiValue(data, ...keys) {
+  for (const key of keys) {
+    if (!data || !Object.prototype.hasOwnProperty.call(data, key)) continue;
+    const value = data[key];
+    if (aiValueToText(value)) return value;
+  }
+  return '';
+}
+
+function aiTableOfContentsToText(value) {
+  if (value === null || value === undefined) return '';
+
+  if (Array.isArray(value)) {
+    return value
+      .map(formatTocEntry)
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  if (typeof value === 'object') {
+    const nested = pickAiValue(value, 'items', 'capitulos', 'capítulos', 'secciones', 'entries', 'lineas', 'líneas');
+    if (nested) return aiTableOfContentsToText(nested);
+    const singleEntry = formatTocEntry(value);
+    if (singleEntry) return singleEntry;
+    return Object.values(value)
+      .map(formatTocEntry)
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  return String(value)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\s*\|\s*/g, '\n')
+    .trim();
+}
+
+function formatTocEntry(value) {
+  if (value === null || value === undefined) return '';
+  if (Array.isArray(value)) return value.map(formatTocEntry).filter(Boolean).join(' - ');
+  if (typeof value !== 'object') return String(value).trim();
+
+  const number = aiValueToText(value.numero ?? value.número ?? value.capitulo ?? value.capítulo ?? value.seccion ?? value.sección);
+  const title = aiValueToText(value.titulo ?? value.título ?? value.nombre ?? value.tema ?? value.descripcion ?? value.descripción);
+  const page = aiValueToText(value.pagina ?? value.página ?? value.pag ?? value.page);
+  const pieces = [number, title].filter(Boolean);
+  if (page) pieces.push(`p. ${page.replace(/^p\.?\s*/i, '')}`);
+  return pieces.join(' - ').trim();
 }
 
 function aiValueToText(value) {
@@ -3203,6 +3466,7 @@ function hideProcessingOverlay() {
 
 // ========== RESULTADO DE ESCANEO ==========
 function populateRecordForm(record, totalPages) {
+  const resolvedPageCount = totalPages || getRecordPageCount(record);
   document.getElementById('record-id-badge').textContent = `ID: ${record.id}`;
   document.getElementById('field-titulo').value = record.titulo_principal || '';
   document.getElementById('field-subtitulo').value = record.subtitulo || '';
@@ -3211,7 +3475,7 @@ function populateRecordForm(record, totalPages) {
   document.getElementById('field-editorial').value = record.editorial || '';
   document.getElementById('field-lugar').value = record.lugar_publicacion || '';
   document.getElementById('field-anio').value = record.anio_publicacion || '';
-  document.getElementById('field-paginas').value = record.numero_paginas || record.descripcion_fisica || `${totalPages} p.`;
+  document.getElementById('field-paginas').value = record.numero_paginas || record.descripcion_fisica || (resolvedPageCount ? `${resolvedPageCount} p.` : '');
   document.getElementById('field-soporte-fisico').value = record.soporte_fisico || '';
   document.getElementById('field-dimensiones').value = record.dimensiones || '';
   document.getElementById('field-pdf-url').value = record.url_recurso_en_linea || record.enlace_documento || '';
@@ -3224,16 +3488,17 @@ function populateRecordForm(record, totalPages) {
   document.getElementById('field-resumen').value = record.resumen || '';
   document.getElementById('field-tabla-contenidos').value = record.tabla_contenidos || '';
 
-  const sanitizedPdfName = (record.titulo_principal || 'Documento_Digitalizado')
-    .replace(/[\\/*?:"<>|]/g, '').replace(/\s+/g, '_') + '.pdf';
+  const sanitizedPdfName = record.enlace_documento
+    || record.url_recurso_en_linea
+    || `${sanitizeFilename(record.titulo_principal || 'Documento_Digitalizado')}.pdf`;
 
   const pdfCard = document.getElementById('pdf-generated-card');
   pdfCard.classList.remove('hidden');
   document.getElementById('pdf-filename-display').textContent = sanitizedPdfName;
-  document.getElementById('pdf-pages-display').textContent = `${totalPages} hojas → 1 PDF Unificado`;
+  document.getElementById('pdf-pages-display').textContent = `${resolvedPageCount || 0} hojas guardadas`;
 
   document.getElementById('btn-open-pdf').onclick = () => {
-    downloadCompiledPDF(sanitizedPdfName);
+    downloadCompiledPDF(sanitizedPdfName, getRecordPages(record));
   };
 }
 
@@ -3275,9 +3540,9 @@ function collectRecordFromForm(baseRecord = {}) {
   };
 }
 
-function onBookScanCompleted(record, totalPages) {
-  setActiveRecord(record);
-  populateRecordForm(record, totalPages);
+function onBookScanCompleted(record, totalPages, pagesBase64 = null) {
+  const storedRecord = setActiveRecord(attachPagesToRecord(record, totalPages, pagesBase64));
+  populateRecordForm(storedRecord, getRecordPageCount(storedRecord));
   updateHomeOverview();
   scheduleDraftSave();
 
@@ -3362,8 +3627,10 @@ async function saveAndShareFileNative(base64Data, filename, mimeType) {
 }
 
 // ========== DESCARGA CON NOTIFICACIÓN NATIVA EN BARRA DE ANDROID ==========
-async function downloadCompiledPDF(filename) {
-  const pages = getCompiledPdfPages();
+async function downloadCompiledPDF(filename, pagesOverride = null) {
+  const pages = Array.isArray(pagesOverride) && pagesOverride.length
+    ? pagesOverride
+    : getCompiledPdfPages();
   if (!pages || pages.length === 0) {
     alert('No hay hojas para generar el PDF.');
     return;
@@ -3425,13 +3692,13 @@ async function handleFormSubmit(e) {
   const updatedRecord = collectRecordFromForm(state.currentRecord || {});
   const sanitizedPdfName = updatedRecord.enlace_documento || 'Documento_Digitalizado.pdf';
 
-  setActiveRecord(updatedRecord);
+  const storedRecord = setActiveRecord(attachPagesToRecord(updatedRecord, getRecordPageCount(updatedRecord)));
 
   renderKohaRecordsTable();
   scheduleDraftSave();
 
   // Guardar y descargar PDF con notificación en la barra de Android
-  await downloadCompiledPDF(sanitizedPdfName);
+  await downloadCompiledPDF(sanitizedPdfName, getRecordPages(storedRecord));
   document.querySelector('[data-target="screen-export"]').click();
 }
 
@@ -3439,13 +3706,13 @@ async function handleFormSubmit(e) {
 function renderKohaRecordsTable() {
   const tbody = document.getElementById('koha-records-body');
   tbody.innerHTML = '';
-  document.getElementById('pending-count').textContent = state.records.length ? 1 : 0;
+  document.getElementById('pending-count').textContent = state.records.length;
   updateHomeOverview();
   renderRecordsStrip();
 
   if (state.records.length === 0) {
     tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--text-muted);padding:20px;">
-      No hay libros catalogados en este lote. Escanee un libro o cargue un PDF.</td></tr>`;
+      No hay libros guardados. Escanee un libro o cargue un PDF.</td></tr>`;
     return;
   }
 
@@ -3465,11 +3732,23 @@ function renderKohaRecordsTable() {
 
   const actionTd = document.createElement('td');
   actionTd.dataset.label = 'Acción';
+  actionTd.className = 'table-action-cell';
+  const pdfBtn = document.createElement('button');
+  pdfBtn.type = 'button';
+  pdfBtn.className = 'btn-secondary table-action-btn';
+  pdfBtn.textContent = 'PDF';
+  pdfBtn.disabled = getRecordPages(selected).length === 0;
+  pdfBtn.title = pdfBtn.disabled ? 'Este registro no tiene hojas guardadas' : 'Descargar PDF guardado';
+  pdfBtn.addEventListener('click', () => {
+    const filename = selected.enlace_documento || selected.url_recurso_en_linea || `${sanitizeFilename(selected.titulo_principal || 'Documento_Digitalizado')}.pdf`;
+    downloadCompiledPDF(filename, getRecordPages(selected));
+  });
   const editBtn = document.createElement('button');
   editBtn.type = 'button';
   editBtn.className = 'btn-secondary table-action-btn';
   editBtn.textContent = 'Formulario';
   editBtn.addEventListener('click', () => window.editRecord(selected.id));
+  actionTd.appendChild(pdfBtn);
   actionTd.appendChild(editBtn);
   tr.appendChild(actionTd);
   tbody.appendChild(tr);
@@ -3508,6 +3787,7 @@ function renderRecordsStrip() {
     button.appendChild(meta);
     button.addEventListener('click', () => {
       state.activeRecordId = rec.id;
+      state.currentRecord = rec;
       renderKohaRecordsTable();
       scheduleDraftSave();
     });
@@ -3522,6 +3802,7 @@ function getActiveExportRecord() {
     rec = state.records[0];
     state.activeRecordId = rec.id;
   }
+  state.currentRecord = rec;
   return rec;
 }
 
@@ -3590,145 +3871,197 @@ window.editRecord = function(id) {
   const rec = state.records.find(r => r.id === id);
   if (rec) {
     state.activeRecordId = rec.id;
-    onBookScanCompleted(rec, parseInt(rec.numero_paginas) || 0);
+    state.currentRecord = rec;
+    populateRecordForm(rec, getRecordPageCount(rec));
+    renderRecordsStrip();
+    scheduleDraftSave();
+    document.querySelector('[data-target="screen-review"]').click();
   }
 };
 
-// ========== EXPORTACIÓN KOHA MARC21 ==========
-const KOHA_CSV_HEADERS = [
-  '001',
-  '003',
-  '020$a',
-  '040$c',
-  '084$a',
-  '100$a',
-  '245$a',
-  '245$b',
-  '700$a',
-  '260$a',
-  '260$b',
-  '260$c',
-  '300$a',
-  '300$b',
-  '300$c',
-  '500$a',
-  '505$a',
-  '520$a',
-  '650$a',
-  '653$a',
-  '856$y',
-  '856$u',
-  '942$2',
-  '942$c',
-  '952$a',
-  '952$b',
-  '952$y',
-  '952$o',
-  '952$u'
-];
-
-async function downloadKohaCSV() {
-  if (state.records.length === 0) {
-    alert('No hay registros para exportar.');
-    return;
-  }
-
-  const sep = ',';
-  let csv = '\uFEFF' + KOHA_CSV_HEADERS.map(h => `"${h}"`).join(sep) + '\n';
-
-  state.records.forEach(rec => {
-    csv += buildKohaExportRow(rec).map(escCsv).join(sep) + '\n';
-  });
-
-  downloadTextFile(csv, `${getExportBaseName()}.csv`, 'text/csv');
-}
-
 async function downloadKohaExcel() {
-  if (state.records.length === 0) {
+  const record = getActiveExportRecord();
+  if (!record) {
     alert('No hay registros para exportar.');
     return;
   }
 
-  const html = buildKohaExcelWorkbook(state.records);
-  downloadTextFile(html, `${getExportBaseName()}.xls`, 'application/vnd.ms-excel');
-}
-
-function buildKohaExportRow(rec) {
-  const physical = physicalMarcParts(rec);
-  const resourceUrl = rec.url_recurso_en_linea || rec.enlace_documento || '';
-  const itemType = normalizeKohaItemType(rec.tipo_material);
-  return [
-    rec.id,
-    buildControl003(rec),
-    rec.isbn,
-    'CIESPAL.',
-    rec.clasificacion,
-    rec.autor_principal,
-    rec.titulo_principal,
-    rec.subtitulo,
-    joinMarcValues(rec.colaboradores || rec.autores_secundarios),
-    rec.lugar_publicacion,
-    rec.editorial,
-    rec.anio_publicacion,
-    physical.extent,
-    physical.support,
-    physical.dimensions,
-    rec.notas_fisicas,
-    rec.tabla_contenidos,
-    rec.resumen,
-    joinMarcValues(rec.temas_controlados || rec.temas, true),
-    joinMarcValues(rec.descriptores_libres || rec.palabras_clave, true),
-    resourceUrl ? CIESPAL_KOHA_PROFILE.resourceLabel : '',
-    resourceUrl,
-    CIESPAL_KOHA_PROFILE.classificationSource,
-    itemType,
-    CIESPAL_KOHA_PROFILE.branchId,
-    CIESPAL_KOHA_PROFILE.branchId,
-    itemType,
-    rec.clasificacion,
-    resourceUrl
-  ];
+  const html = buildKohaExcelWorkbook([record]);
+  downloadTextFile(html, `${getRecordExportBaseName(record)}_ficha_bibliografica.xls`, 'application/vnd.ms-excel');
 }
 
 function buildKohaExcelWorkbook(records) {
-  const rows = records.map(buildKohaExportRow);
-  const headerHtml = KOHA_CSV_HEADERS
-    .map(header => `<th>${xmlEscape(header)}</th>`)
+  const rows = records
+    .flatMap((record, index) => buildBibliographicFichaRows(record, index))
+    .filter(Boolean);
+  const rowsXml = rows
+    .map(row => buildBibliographicFichaRowXml(row))
     .join('');
-  const bodyHtml = rows.map(row => `
-    <tr>${row.map(value => `<td>${xmlEscape(value)}</td>`).join('')}</tr>
-  `).join('');
 
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <style>
-    body { font-family: Arial, sans-serif; }
-    table { border-collapse: collapse; width: 100%; }
-    th { background: #1d6295; color: #ffffff; font-weight: 700; }
-    th, td { border: 1px solid #b8c7d4; padding: 8px; vertical-align: top; mso-number-format:"\\@"; }
-    td { white-space: pre-wrap; }
-    tr:nth-child(even) td { background: #f3f7fb; }
-  </style>
-</head>
-<body>
-  <table>
-    <thead><tr>${headerHtml}</tr></thead>
-    <tbody>${bodyHtml}</tbody>
-  </table>
-</body>
-</html>`;
+  return `\uFEFF<?xml version="1.0" encoding="UTF-8"?>
+<?mso-application progid="Excel.Sheet"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:o="urn:schemas-microsoft-com:office:office"
+ xmlns:x="urn:schemas-microsoft-com:office:excel"
+ xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:html="http://www.w3.org/TR/REC-html40">
+ <DocumentProperties xmlns="urn:schemas-microsoft-com:office:office">
+  <Author>CIESPAL</Author>
+  <Title>Ficha bibliográfica MARC21</Title>
+ </DocumentProperties>
+ <Styles>
+  <Style ss:ID="Default" ss:Name="Normal">
+   <Alignment ss:Vertical="Top" ss:WrapText="1"/>
+   <Font ss:FontName="Calibri" ss:Size="11" ss:Color="#17212B"/>
+  </Style>
+  <Style ss:ID="TitleLabel">
+   <Alignment ss:Vertical="Center" ss:WrapText="1"/>
+   <Font ss:FontName="Calibri" ss:Size="12" ss:Bold="1" ss:Color="#FFFFFF"/>
+   <Interior ss:Color="#1D6295" ss:Pattern="Solid"/>
+  </Style>
+  <Style ss:ID="TitleValue">
+   <Alignment ss:Vertical="Center" ss:WrapText="1"/>
+   <Font ss:FontName="Calibri" ss:Size="12" ss:Bold="1" ss:Color="#FFFFFF"/>
+   <Interior ss:Color="#1D6295" ss:Pattern="Solid"/>
+  </Style>
+  <Style ss:ID="Section">
+   <Alignment ss:Vertical="Center" ss:WrapText="1"/>
+   <Font ss:FontName="Calibri" ss:Size="11" ss:Bold="1" ss:Color="#123B55"/>
+   <Interior ss:Color="#E8F2F8" ss:Pattern="Solid"/>
+  </Style>
+  <Style ss:ID="Field">
+   <Alignment ss:Vertical="Top" ss:WrapText="1"/>
+   <Font ss:FontName="Calibri" ss:Size="11" ss:Bold="1" ss:Color="#1D6295"/>
+   <Interior ss:Color="#F5F9FC" ss:Pattern="Solid"/>
+   <Borders>
+    <Border ss:Position="Bottom" ss:LineStyle="Continuous" ss:Weight="1" ss:Color="#CBD8E3"/>
+    <Border ss:Position="Left" ss:LineStyle="Continuous" ss:Weight="1" ss:Color="#CBD8E3"/>
+    <Border ss:Position="Right" ss:LineStyle="Continuous" ss:Weight="1" ss:Color="#CBD8E3"/>
+    <Border ss:Position="Top" ss:LineStyle="Continuous" ss:Weight="1" ss:Color="#CBD8E3"/>
+   </Borders>
+  </Style>
+  <Style ss:ID="Value">
+   <Alignment ss:Vertical="Top" ss:WrapText="1"/>
+   <Font ss:FontName="Calibri" ss:Size="11" ss:Color="#17212B"/>
+   <Borders>
+    <Border ss:Position="Bottom" ss:LineStyle="Continuous" ss:Weight="1" ss:Color="#CBD8E3"/>
+    <Border ss:Position="Left" ss:LineStyle="Continuous" ss:Weight="1" ss:Color="#CBD8E3"/>
+    <Border ss:Position="Right" ss:LineStyle="Continuous" ss:Weight="1" ss:Color="#CBD8E3"/>
+    <Border ss:Position="Top" ss:LineStyle="Continuous" ss:Weight="1" ss:Color="#CBD8E3"/>
+   </Borders>
+  </Style>
+  <Style ss:ID="Spacer">
+   <Font ss:FontName="Calibri" ss:Size="4"/>
+  </Style>
+ </Styles>
+ <Worksheet ss:Name="Ficha MARC21">
+  <Table ss:ExpandedColumnCount="2" ss:ExpandedRowCount="${rows.length}" x:FullColumns="1" x:FullRows="1" ss:DefaultRowHeight="18">
+   <Column ss:AutoFitWidth="0" ss:Width="210"/>
+   <Column ss:AutoFitWidth="0" ss:Width="520"/>
+${rowsXml}  </Table>
+  <WorksheetOptions xmlns="urn:schemas-microsoft-com:office:excel">
+   <PageSetup>
+    <Layout x:Orientation="Portrait"/>
+   </PageSetup>
+   <Selected/>
+   <FreezePanes/>
+   <FrozenNoSplit/>
+   <SplitHorizontal>1</SplitHorizontal>
+   <TopRowBottomPane>1</TopRowBottomPane>
+   <ActivePane>2</ActivePane>
+  </WorksheetOptions>
+ </Worksheet>
+</Workbook>`;
+}
+
+function buildBibliographicFichaRows(rec, index) {
+  const title = rec.titulo_principal || `Registro ${index + 1}`;
+  const physical = physicalMarcParts(rec);
+  const resourceUrl = rec.url_recurso_en_linea || rec.enlace_documento || '';
+
+  return [
+    { type: 'title', label: 'FICHA BIBLIOGRÁFICA MARC21', value: title },
+    { type: 'spacer' },
+    { type: 'section', label: 'IDENTIFICACIÓN DE LA OBRA' },
+    { label: '020a - ISBN', value: rec.isbn },
+    { label: '245a - Título', value: rec.titulo_principal },
+    { label: '245b - Subtítulo', value: rec.subtitulo },
+    { label: '100a - Autor Principal', value: rec.autor_principal },
+    { label: '700a - Colaboradores', value: joinMarcValues(rec.colaboradores || rec.autores_secundarios) },
+    { type: 'spacer' },
+    { type: 'section', label: 'PUBLICACIÓN Y DESCRIPCIÓN FÍSICA' },
+    { label: '260a - Lugar de Publicación', value: rec.lugar_publicacion },
+    { label: '260b - Editorial', value: rec.editorial },
+    { label: '260c - Año de Publicación', value: rec.anio_publicacion },
+    { label: '300a - Descripción Física', value: formatPhysicalDescription(physical) },
+    { label: '500a - Notas Físicas', value: rec.notas_fisicas },
+    { label: 'Naturaleza - Tipo de Material', value: formatMaterialForFicha(rec.tipo_material) },
+    { type: 'spacer' },
+    { type: 'section', label: 'INDEXACIÓN Y CLASIFICACIÓN' },
+    { label: '650a - Temas', value: joinMarcValues(rec.temas_controlados || rec.temas, true) },
+    { label: '084a - Clasificación', value: rec.clasificacion },
+    { label: '520a - Resumen', value: rec.resumen },
+    { type: 'spacer' },
+    { type: 'section', label: 'TABLA DE CONTENIDOS' },
+    ...buildTableOfContentsFichaRows(rec.tabla_contenidos),
+    { type: 'spacer' },
+    { type: 'section', label: 'RECURSO DIGITAL KOHA' },
+    { label: '856u - Enlace al Documento', value: resourceUrl },
+    { type: 'spacer' }
+  ];
+}
+
+function buildTableOfContentsFichaRows(value) {
+  const lines = splitContentLines(value);
+  if (!lines.length) return [{ label: '505a - Índice', value: '' }];
+  return lines.map((line, index) => ({
+    label: index === 0 ? '505a - Índice' : '',
+    value: line
+  }));
+}
+
+function buildBibliographicFichaRowXml(row) {
+  if (row.type === 'spacer') {
+    return '   <Row ss:AutoFitHeight="0" ss:Height="8"><Cell ss:MergeAcross="1" ss:StyleID="Spacer"><Data ss:Type="String"></Data></Cell></Row>\n';
+  }
+  if (row.type === 'section') {
+    return `   <Row ss:AutoFitHeight="1"><Cell ss:MergeAcross="1" ss:StyleID="Section"><Data ss:Type="String">${excelXmlText(row.label)}</Data></Cell></Row>\n`;
+  }
+  const labelStyle = row.type === 'title' ? 'TitleLabel' : 'Field';
+  const valueStyle = row.type === 'title' ? 'TitleValue' : 'Value';
+  return `   <Row ss:AutoFitHeight="1"><Cell ss:StyleID="${labelStyle}"><Data ss:Type="String">${excelXmlText(row.label)}</Data></Cell><Cell ss:StyleID="${valueStyle}"><Data ss:Type="String">${excelXmlText(row.value)}</Data></Cell></Row>\n`;
+}
+
+function formatPhysicalDescription(physical) {
+  return [physical.extent, physical.support, physical.dimensions]
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function formatMaterialForFicha(value) {
+  const normalized = normalizeKohaItemType(value);
+  if (normalized === CIESPAL_KOHA_PROFILE.itemType) return 'Texto';
+  return value || normalized;
+}
+
+function excelXmlText(value) {
+  return xmlEscape(value)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\n/g, '&#10;');
 }
 
 async function downloadKohaMARCXML() {
-  if (state.records.length === 0) {
+  const record = getActiveExportRecord();
+  if (!record) {
     alert('No hay registros para exportar.');
     return;
   }
 
-  const xml = buildMARCXMLCollection(state.records);
-  downloadTextFile(xml, `${getExportBaseName()}.xml`, 'application/marcxml+xml');
+  const xml = buildMARCXMLCollection([record]);
+  downloadTextFile(xml, `${getRecordExportBaseName(record)}.xml`, 'application/marcxml+xml');
 }
 
 function buildMARCXMLCollection(records) {
@@ -3858,17 +4191,16 @@ function joinMarcValues(value, splitCommas = false) {
   return splitMarcValues(value, splitCommas).join(' | ');
 }
 
-function getExportBaseName() {
-  if (state.records.length === 1) {
-    return sanitizeFilename(state.records[0].titulo_principal || 'Documento_CIESPAL');
-  }
-  if (state.currentRecord?.titulo_principal) {
-    return sanitizeFilename(state.currentRecord.titulo_principal);
-  }
-  if (state.records.length > 1) {
-    return sanitizeFilename(`${state.records[0].titulo_principal || 'Lote'}_y_${state.records.length - 1}_libros`);
-  }
-  return 'Catalogo_CIESPAL';
+function getExportBaseName(record = null) {
+  return getRecordExportBaseName(record || getActiveExportRecord());
+}
+
+function getRecordExportBaseName(record = null) {
+  const raw = record?.titulo_principal
+    || record?.enlace_documento
+    || record?.url_recurso_en_linea
+    || 'Documento_CIESPAL';
+  return sanitizeFilename(String(raw).replace(/\.[a-z0-9]+$/i, ''));
 }
 
 function downloadTextFile(content, filename, mimeType) {
@@ -3878,20 +4210,6 @@ function downloadTextFile(content, filename, mimeType) {
     binary += String.fromCharCode(utf8Bytes[i]);
   }
   triggerAndroidSystemDownload(btoa(binary), filename, mimeType);
-}
-
-/**
- * Formatea y escapa cadenas para CSV cumpliendo el estándar RFC 4180.
- * Las celdas se ajustan al texto sin cortar filas ni comprimir datos.
- */
-function escCsv(str) {
-  if (str === null || str === undefined || str === '') return '""';
-  const cleanStr = String(str)
-    .trim()
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .replace(/"/g, '""');
-  return `"${cleanStr}"`;
 }
 
 function xmlEscape(value) {
